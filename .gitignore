@@ -31,6 +31,9 @@ __pycache__/
 # Instruções locais para agentes — não subir ao GitHub
 CLAUDE.md
 
+# Alinhamento local — histórico operacional detalhado, não versionado
+CHANGELOG.md
+
 # Documentação operacional interna — IPs, credenciais de referência, dados do HomeLAB
 docs/hosts.md
 docs/postmortem/

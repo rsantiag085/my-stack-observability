@@ -123,7 +123,7 @@ observability/
 ├── OVERVIEW.md                    ← Visão geral completa do ambiente (comece aqui)
 ├── CLAUDE.md
 ├── README.md
-├── CHANGELOG.md
+├── CHANGELOG.md                   ← Histórico de mudanças (local — no .gitignore)
 ├── SECURITY.md
 ├── graphviz_guide.md
 ├── Makefile
@@ -173,7 +173,6 @@ observability/
 | GraphViz Guide | [`graphviz_guide.md`](graphviz_guide.md) | Testes do plugin GraphViz no Grafana 13 |
 | Agente SRE | [`AGENT.md`](AGENT.md) | Especificação do agente autônomo de SRE |
 | Segurança | [`SECURITY.md`](SECURITY.md) | Política de segurança do lab |
-| Changelog | [`CHANGELOG.md`](CHANGELOG.md) | Histórico completo de mudanças |
 
 ---
 

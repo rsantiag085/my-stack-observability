@@ -402,7 +402,7 @@ ssh 192.168.10.204   # zabbix-proxy
 | `README.md` | Como operar a stack de observabilidade (make up, comandos, healthcheck) |
 | `docs/setup-guide.md` | Guia completo de setup do zero ao ambiente (público) |
 | `docs/hosts.md` | Inventário técnico detalhado de cada VM |
-| `CHANGELOG.md` | Histórico completo de todas as alterações do ambiente |
+| `CHANGELOG.md` | Histórico completo de todas as alterações do ambiente — não versionado (`.gitignore`) |
 | `SECURITY.md` | Políticas e checklist de segurança pré-push |
 | `graphviz_guide.md` | Documentação do experimento GraphViz no Grafana 13 |
 | `CLAUDE.md` | Instruções locais para agentes de IA — não versionado (`.gitignore`) |

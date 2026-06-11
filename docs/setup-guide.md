@@ -1758,4 +1758,4 @@ Detalhes em `docs/runbooks/RB-004-instalacao-kubernetes-mcp-server.md`.
 
 ---
 
-> **Dúvidas ou divergências?** O `CHANGELOG.md` tem o histórico completo de cada mudança com o motivo. O `OVERVIEW.md` tem a visão macro do ambiente. Os runbooks em `docs/runbooks/` cobrem os cenários de falha mais comuns.
+> **Dúvidas ou divergências?** O `OVERVIEW.md` tem a visão macro do ambiente e o histórico de decisões. Os runbooks em `docs/runbooks/` cobrem os cenários de falha mais comuns.
