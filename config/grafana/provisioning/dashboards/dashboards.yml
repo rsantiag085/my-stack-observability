@@ -1,0 +1,16 @@
+apiVersion: 1
+
+# File provisioning desabilitado — dashboards gerenciados via UI e API do Grafana.
+# allowUiUpdates: true não funciona no Grafana 13 (Unified Storage).
+# Workflow: editar no Grafana → exportar via API → salvar JSON → commitar.
+# Para importar em setup fresh: usar scripts/import-dashboards.sh
+#
+# providers:
+#   - name: lab
+#     folder: Lab
+#     type: file
+#     disableDeletion: false
+#     editable: true
+#     updateIntervalSeconds: 30
+#     options:
+#       path: /var/lib/grafana/dashboards

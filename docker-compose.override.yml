@@ -1,0 +1,2 @@
+# Override local — não utilizado neste ambiente (portas padrão já definidas no docker-compose.yml).
+# Manter para referência caso seja necessário remapear portas em host com conflitos.

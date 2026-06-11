@@ -1,0 +1,263 @@
+digraph homelab {
+
+    graph [
+        fontname  = "Helvetica"
+        fontsize  = 22
+        bgcolor   = "#0f1117"
+        pad       = "1.0"
+        ranksep   = "1.2"
+        nodesep   = "0.6"
+        splines   = polyline
+        rankdir   = TB
+        size      = "16,9"
+        ratio     = fill
+        label     = "HomeLAB Proxmox  ·  192.168.10.0/24"
+        labelloc  = t
+        fontcolor = "#e2e8f0"
+    ]
+
+    node [
+        fontname  = "Helvetica"
+        fontsize  = 11
+        style     = "filled,rounded"
+        shape     = box
+        margin    = "0.3,0.18"
+        penwidth  = 0
+    ]
+
+    edge [
+        fontname  = "Helvetica"
+        fontsize  = 9
+        fontcolor = "#94a3b8"
+        penwidth  = 1.6
+        arrowsize = 0.7
+    ]
+
+    // -----------------------------------------------------------------------
+    // COLUNA 1 — ZABBIX STACK
+    // -----------------------------------------------------------------------
+    subgraph cluster_zabbix {
+        label     = "Stack Zabbix"
+        fontcolor = "#e9d5ff"
+        fontsize  = 13
+        style     = "filled,rounded"
+        fillcolor = "#1a1030"
+        color     = "#7c3aed"
+        penwidth  = 2
+        margin    = 18
+
+        zproxy [
+            label     = "zabbix-proxy\n.204  :10051"
+            fillcolor = "#3b0764"
+            fontcolor = "#e9d5ff"
+        ]
+        zsrv [
+            label     = "zabbix-server\n.202  :10051"
+            fillcolor = "#4c1d95"
+            fontcolor = "#ede9fe"
+        ]
+        zfront [
+            label     = "zabbix-front\n.203  :80"
+            fillcolor = "#5b21b6"
+            fontcolor = "#f5f3ff"
+        ]
+        zdb [
+            label     = "zabbix-db\n.201  PostgreSQL"
+            fillcolor = "#312e81"
+            fontcolor = "#e0e7ff"
+        ]
+
+        zproxy -> zsrv  [label="coleta" color="#7c3aed"]
+        zsrv   -> zfront[dir=back label="API"  color="#8b5cf6"]
+        zsrv   -> zdb   [label="dados" color="#6d28d9"]
+    }
+
+    // -----------------------------------------------------------------------
+    // COLUNA 2 — VM ANSIBLE  (LGTM)
+    // -----------------------------------------------------------------------
+    subgraph cluster_ansible {
+        label     = "VM ansible · .104 · Stack de Observabilidade"
+        fontcolor = "#fed7aa"
+        fontsize  = 13
+        style     = "filled,rounded"
+        fillcolor = "#0c1a2e"
+        color     = "#f97316"
+        penwidth  = 2
+        margin    = 18
+
+        grafana [
+            label     = "Grafana 13\n:3000"
+            fillcolor = "#7c2d12"
+            fontcolor = "#fed7aa"
+        ]
+        prometheus [
+            label     = "Prometheus\n:9090"
+            fillcolor = "#78350f"
+            fontcolor = "#fef3c7"
+        ]
+        loki [
+            label     = "Loki 3.0\n:3100"
+            fillcolor = "#164e63"
+            fontcolor = "#cffafe"
+        ]
+        tempo [
+            label     = "Tempo 2.4\n:3200"
+            fillcolor = "#1e1b4b"
+            fontcolor = "#c7d2fe"
+        ]
+        otel [
+            label     = "OTEL Collector\n:4317 gRPC / :4318 HTTP"
+            fillcolor = "#14532d"
+            fontcolor = "#bbf7d0"
+        ]
+        promtail [
+            label     = "Promtail\n:9080  (Docker socket)"
+            fillcolor = "#0c2a4a"
+            fontcolor = "#bae6fd"
+        ]
+
+        grafana    -> prometheus [label="PromQL"    color="#f59e0b"]
+        grafana    -> loki       [label="LogQL"     color="#22d3ee"]
+        grafana    -> tempo      [label="TraceQL"   color="#818cf8"]
+        otel       -> prometheus [label="remote_write" color="#4ade80"]
+        otel       -> loki       [label="logs push"    color="#4ade80"]
+        otel       -> tempo      [label="OTLP"         color="#4ade80"]
+        tempo      -> prometheus [label="span metrics" color="#818cf8" style=dashed]
+        promtail   -> loki       [label="logs push"    color="#38bdf8"]
+    }
+
+    // -----------------------------------------------------------------------
+    // COLUNA 3 — VM DOCKER  (K8s)
+    // -----------------------------------------------------------------------
+    subgraph cluster_docker {
+        label     = "VM docker · .112 · Kubernetes"
+        fontcolor = "#bfdbfe"
+        fontsize  = 13
+        style     = "filled,rounded"
+        fillcolor = "#070f1f"
+        color     = "#3b82f6"
+        penwidth  = 2
+        margin    = 18
+
+        minikube [
+            label     = "Minikube\ncluster K8s"
+            fillcolor = "#1e3a8a"
+            fontcolor = "#bfdbfe"
+            shape     = cylinder
+        ]
+        painel [
+            label     = "painel-estudos-sre\nFastAPI · v1.2\nport-forward :8080"
+            fillcolor = "#0f2b6e"
+            fontcolor = "#dbeafe"
+        ]
+        ksm [
+            label     = "kube-state-metrics\nHelm v2.19\nport-forward :32080"
+            fillcolor = "#0f2b6e"
+            fontcolor = "#dbeafe"
+        ]
+
+        minikube -> painel [label="pod" color="#60a5fa"]
+        minikube -> ksm    [label="pod" color="#60a5fa"]
+    }
+
+    // -----------------------------------------------------------------------
+    // COLUNA 4 — VM MCP-SERVER
+    // -----------------------------------------------------------------------
+    subgraph cluster_mcp {
+        label     = "VM mcp-server · .210 · MCP Servers"
+        fontcolor = "#bbf7d0"
+        fontsize  = 13
+        style     = "filled,rounded"
+        fillcolor = "#071a0f"
+        color     = "#22c55e"
+        penwidth  = 2
+        margin    = 18
+
+        zbxmcp [
+            label     = "Zabbix MCP Server\nv1.30  :8080\n237 ferramentas"
+            fillcolor = "#14532d"
+            fontcolor = "#bbf7d0"
+        ]
+        k8smcp [
+            label     = "Kubernetes MCP Server\nv0.0.62  :8081\nread-only"
+            fillcolor = "#14532d"
+            fontcolor = "#dcfce7"
+        ]
+    }
+
+    // -----------------------------------------------------------------------
+    // AGENTE SRE + CLAUDE
+    // -----------------------------------------------------------------------
+    subgraph cluster_agent {
+        label     = "Agente Autônomo de SRE"
+        fontcolor = "#e9d5ff"
+        fontsize  = 13
+        style     = "filled,rounded"
+        fillcolor = "#1a0a2e"
+        color     = "#a855f7"
+        penwidth  = 2
+        margin    = 18
+
+        agent [
+            label     = "agent_orchestrator.py\nwebhook → Claude API → MCP"
+            fillcolor = "#2d1b69"
+            fontcolor = "#e9d5ff"
+        ]
+        notify [
+            label     = "Telegram\nGoogle Chat"
+            fillcolor = "#134e4a"
+            fontcolor = "#ccfbf1"
+        ]
+        agent -> notify [label="alerta\nestruturado" color="#2dd4bf"]
+    }
+
+    // -----------------------------------------------------------------------
+    // ZABBIX AGENT 2 (nó transversal)
+    // -----------------------------------------------------------------------
+    agent2 [
+        label     = "Zabbix Agent 2\ntodas as VMs · :10050"
+        fillcolor = "#1f2937"
+        fontcolor = "#9ca3af"
+        style     = "filled,rounded,dashed"
+        shape     = box
+        penwidth  = 0
+    ]
+
+    // -----------------------------------------------------------------------
+    // EDGES INTER-CLUSTER
+    // -----------------------------------------------------------------------
+
+    // Agent 2 → Proxy
+    agent2 -> zproxy [label="coleta\n:10050" color="#6b7280" style=dashed]
+
+    // MCP → Zabbix API
+    zbxmcp -> zfront [label="Zabbix API" color="#22c55e" style=dashed]
+
+    // MCP → K8s (DNAT :8443)
+    k8smcp -> minikube [label="kubeconfig\nDNAT :8443" color="#4ade80" style=dashed]
+
+    // kube-state-metrics → Prometheus
+    ksm -> prometheus [label="scrape :32080" color="#60a5fa"]
+
+    // Apps → OTEL
+    painel -> otel [label="OTLP :4317" color="#4ade80"]
+
+    // Zabbix webhook → Agente
+    zsrv -> agent [label="webhook" color="#a855f7" style=dashed]
+
+    // Agente → MCP Servers
+    agent -> zbxmcp [label="MCP" color="#a855f7"]
+    agent -> k8smcp [label="MCP" color="#a855f7"]
+
+    // Agente → Claude API (nó externo)
+    claude [
+        label     = "Claude API\n(Anthropic)"
+        fillcolor = "#4c1d95"
+        fontcolor = "#f5f3ff"
+        shape     = box
+        style     = "filled,rounded"
+        penwidth  = 0
+    ]
+    agent  -> claude [label="API call" color="#c084fc"]
+    claude -> agent  [label="resposta" color="#c084fc" style=dashed]
+}

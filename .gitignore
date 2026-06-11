@@ -1,0 +1,38 @@
+# Secrets — nunca commitar
+.env
+.env.ssh
+.env.mcp-server
+.env.agent
+.env.zabbix-agent
+
+# Certificados gerados localmente
+config/nginx/certs/
+*.pem
+*.key
+*.crt
+
+# SO
+.DS_Store
+Thumbs.db
+
+# Editores
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs do agente — contêm tokens em URLs (Telegram) e dados operacionais
+logs/
+
+# Bytecode Python
+__pycache__/
+*.pyc
+
+# Instruções locais para agentes — não subir ao GitHub
+CLAUDE.md
+
+# Documentação operacional interna — IPs, credenciais de referência, dados do HomeLAB
+docs/hosts.md
+docs/postmortem/
+docs/runbooks/
+

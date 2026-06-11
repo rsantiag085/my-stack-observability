@@ -1,0 +1,451 @@
+{
+  "uid": "kubernetes-overview",
+  "title": "Kubernetes — Visão Geral",
+  "description": "Estado do cluster Minikube via kube-state-metrics",
+  "tags": ["kubernetes", "kube-state-metrics", "minikube"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Visão Geral do Cluster",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 }
+    },
+
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Nodes",
+      "gridPos": { "x": 0, "y": 1, "w": 4, "h": 4 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "count(kube_node_info)",
+          "legendFormat": "Nodes",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Namespaces",
+      "gridPos": { "x": 4, "y": 1, "w": 4, "h": 4 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "count(kube_namespace_status_phase{phase=\"Active\"})",
+          "legendFormat": "Namespaces",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Deployments",
+      "gridPos": { "x": 8, "y": 1, "w": 4, "h": 4 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "count(kube_deployment_spec_replicas)",
+          "legendFormat": "Deployments",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Pods Running",
+      "gridPos": { "x": 12, "y": 1, "w": 4, "h": 4 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(kube_pod_status_phase{phase=\"Running\"})",
+          "legendFormat": "Running",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Pods com Problema",
+      "gridPos": { "x": 16, "y": 1, "w": 4, "h": 4 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 3 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(kube_pod_status_phase{phase=~\"Pending|Failed|Unknown\"})",
+          "legendFormat": "Com problema",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "PVCs Bound",
+      "gridPos": { "x": 20, "y": 1, "w": 4, "h": 4 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "yellow", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(kube_persistentvolumeclaim_status_phase{phase=\"Bound\"})",
+          "legendFormat": "PVCs Bound",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Pods e Deployments",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 }
+    },
+
+    {
+      "id": 11,
+      "type": "piechart",
+      "title": "Pods por Fase",
+      "gridPos": { "x": 0, "y": 6, "w": 8, "h": 8 },
+      "options": {
+        "pieType": "donut",
+        "displayLabels": ["name", "value"],
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] }
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Running" },  "properties": [{ "id": "color", "value": { "fixedColor": "green",  "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Pending" },  "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Failed" },   "properties": [{ "id": "color", "value": { "fixedColor": "red",    "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Succeeded" },"properties": [{ "id": "color", "value": { "fixedColor": "blue",   "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Unknown" },  "properties": [{ "id": "color", "value": { "fixedColor": "gray",   "mode": "fixed" } }] }
+        ]
+      },
+      "targets": [
+        { "expr": "sum(kube_pod_status_phase{phase=\"Running\"})",   "legendFormat": "Running",   "refId": "A" },
+        { "expr": "sum(kube_pod_status_phase{phase=\"Pending\"})",   "legendFormat": "Pending",   "refId": "B" },
+        { "expr": "sum(kube_pod_status_phase{phase=\"Failed\"})",    "legendFormat": "Failed",    "refId": "C" },
+        { "expr": "sum(kube_pod_status_phase{phase=\"Succeeded\"})", "legendFormat": "Succeeded", "refId": "D" },
+        { "expr": "sum(kube_pod_status_phase{phase=\"Unknown\"})",   "legendFormat": "Unknown",   "refId": "E" }
+      ]
+    },
+
+    {
+      "id": 12,
+      "type": "table",
+      "title": "Deployments — Status de Réplicas",
+      "gridPos": { "x": 8, "y": 6, "w": 16, "h": 8 },
+      "options": {
+        "sortBy": [{ "displayName": "Namespace", "desc": false }],
+        "footer": { "show": false }
+      },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Desejado" },
+            "properties": [{ "id": "custom.width", "value": 100 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Prontas" },
+            "properties": [
+              { "id": "custom.width", "value": 100 },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } },
+              { "id": "custom.displayMode", "value": "color-background" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Indisponíveis" },
+            "properties": [
+              { "id": "custom.width", "value": 120 },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } },
+              { "id": "custom.displayMode", "value": "color-background" }
+            ]
+          }
+        ]
+      },
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "namespace": "Namespace",
+              "deployment": "Deployment",
+              "Value #A": "Desejado",
+              "Value #B": "Prontas",
+              "Value #C": "Indisponíveis"
+            },
+            "excludeByName": { "Time": true }
+          }
+        }
+      ],
+      "targets": [
+        { "expr": "kube_deployment_spec_replicas",                    "legendFormat": "", "refId": "A", "instant": true, "format": "table" },
+        { "expr": "kube_deployment_status_replicas_ready",            "legendFormat": "", "refId": "B", "instant": true, "format": "table" },
+        { "expr": "kube_deployment_status_replicas_unavailable",      "legendFormat": "", "refId": "C", "instant": true, "format": "table" }
+      ]
+    },
+
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Containers e Reinicializações",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 14, "w": 24, "h": 1 }
+    },
+
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Reinicializações de Containers (total acumulado)",
+      "gridPos": { "x": 0, "y": 15, "w": 14, "h": 8 },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (namespace, pod, container) (kube_pod_container_status_restarts_total) > 0",
+          "legendFormat": "{{namespace}}/{{pod}}/{{container}}",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 22,
+      "type": "table",
+      "title": "Containers — Status Atual",
+      "gridPos": { "x": 14, "y": 15, "w": 10, "h": 8 },
+      "options": { "footer": { "show": false } },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Running" },
+            "properties": [
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } },
+              { "id": "custom.displayMode", "value": "color-background" },
+              { "id": "custom.width", "value": 90 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Restarts" },
+            "properties": [
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } },
+              { "id": "custom.displayMode", "value": "color-background" },
+              { "id": "custom.width", "value": 90 }
+            ]
+          }
+        ]
+      },
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "Value #A": "Running",
+              "Value #B": "Restarts"
+            },
+            "excludeByName": { "Time": true }
+          }
+        }
+      ],
+      "targets": [
+        { "expr": "kube_pod_container_status_running",           "legendFormat": "", "refId": "A", "instant": true, "format": "table" },
+        { "expr": "kube_pod_container_status_restarts_total",    "legendFormat": "", "refId": "B", "instant": true, "format": "table" }
+      ]
+    },
+
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Storage",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 23, "w": 24, "h": 1 }
+    },
+
+    {
+      "id": 31,
+      "type": "table",
+      "title": "PersistentVolumeClaims",
+      "gridPos": { "x": 0, "y": 24, "w": 24, "h": 7 },
+      "options": { "footer": { "show": false } },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Fase" },
+            "properties": [
+              { "id": "mappings", "value": [
+                { "type": "value", "options": { "Bound":   { "text": "Bound",   "color": "green"  } } },
+                { "type": "value", "options": { "Pending": { "text": "Pending", "color": "yellow" } } },
+                { "type": "value", "options": { "Lost":    { "text": "Lost",    "color": "red"    } } }
+              ]},
+              { "id": "custom.displayMode", "value": "color-background" },
+              { "id": "custom.width", "value": 100 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Tamanho" },
+            "properties": [
+              { "id": "unit", "value": "bytes" },
+              { "id": "custom.width", "value": 120 }
+            ]
+          }
+        ]
+      },
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "namespace": "Namespace",
+              "persistentvolumeclaim": "PVC",
+              "storageclass": "StorageClass",
+              "Value #A": "Fase",
+              "Value #B": "Tamanho"
+            },
+            "excludeByName": { "Time": true }
+          }
+        }
+      ],
+      "targets": [
+        { "expr": "kube_persistentvolumeclaim_status_phase",                    "legendFormat": "", "refId": "A", "instant": true, "format": "table" },
+        { "expr": "kube_persistentvolumeclaim_resource_requests_storage_bytes", "legendFormat": "", "refId": "B", "instant": true, "format": "table" }
+      ]
+    }
+
+  ]
+}

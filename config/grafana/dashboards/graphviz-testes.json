@@ -1,0 +1,37 @@
+{
+  "id": 610886830194688,
+  "panels": [
+    {
+      "datasource": null,
+      "description": "Grafo est\u00e1tico validando renderiza\u00e7\u00e3o b\u00e1sica do plugin jdbranham-diagram-panel",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 18,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "content": "graph TB\n  subgraph Ingress\n    nginx[\"Nginx\\nReverse Proxy\"]\n  end\n\n  subgraph ObsStack[\"Observability Stack\"]\n    grafana[\"Grafana 13\"]\n    prom[\"Prometheus\"]\n    loki[\"Loki\"]\n    tempo[\"Tempo\"]\n  end\n\n  nginx --> grafana\n  grafana -->|PromQL| prom\n  grafana -->|LogQL| loki\n  grafana -->|TraceQL| tempo\n\n  style nginx fill:#E6F1FB\n  style grafana fill:#FAEEDA\n  style prom fill:#FAECE7\n  style loki fill:#E6F1FB\n  style tempo fill:#EEEDFE",
+        "maxWidth": 100,
+        "theme": "",
+        "useBackground": true
+      },
+      "targets": [],
+      "title": "5.1 \u2014 Topologia do Lab (est\u00e1tico)",
+      "type": "jdbranham-diagram-panel"
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": [
+    "lab",
+    "graphviz"
+  ],
+  "title": "GraphViz \u2014 Testes do Lab",
+  "uid": "3d0ca5b1-a6e8-46a0-a21b-730e79b6feba",
+  "version": 1
+}
