@@ -1,10 +1,40 @@
 #!/usr/bin/env python3
 """
-agent_orchestrator.py — Orquestrador do Agente Autônomo de Incidentes
-======================================================================
+agent_orchestrator.py — [ARQUIVADO] Protótipo v1.0.0 do agente autônomo
+========================================================================
+⚠️  NÃO ESTÁ EM USO. Mantido apenas como registro histórico.
+    A implementação ativa é `scripts/zabbix_agent.py` (Gemini + MCP local).
+
 Repositório : my-stack-observability
-Versão      : 1.0.0
+Versão      : 1.0.0 (protótipo, nunca rodou em produção)
 Criado em   : 2026-05-29
+Arquivado em: 2026-06-11
+
+POR QUE FOI APOSENTADO
+----------------------
+Esta foi a primeira tentativa do agente, junto com o AGENT.md v1.0.0. Usava a
+arquitetura "oficial" de MCP REMOTO da Anthropic — `client.beta.messages.create(
+mcp_servers=[...])` — na qual a cloud da Anthropic conecta de volta aos MCP
+servers. No HomeLAB esses servers vivem em `192.168.10.210` (RFC1918,
+inalcançável da internet), então o modelo é incompatível com a rede privada.
+Nunca foi testado (`--mode test` jamais executado) nem virou serviço; não há
+`/var/log/agent-orchestrator.log`.
+
+O QUE SOBREVIVEU
+----------------
+O contrato conceitual (guardrails, fluxo, formatos de notificação) foi todo
+escrito no `AGENT.md` e segue válido — o `zabbix_agent.py` v2.x carrega o mesmo
+`AGENT.md`. A v2 corrigiu os três becos da v1:
+  1. MCP REMOTO → MCP client LOCAL (loop ReAct dentro da própria rede)
+  2. Claude API → Gemini Flash 2.5 (free tier, custo)
+  3. Sem teste → testado, com cenários de correlação log × métrica
+
+Detalhe de segurança conhecido (não corrigido, pois arquivado): o `FileHandler`
+para `/var/log/agent-orchestrator.log` pode quebrar no import se o caminho não
+for gravável. Não reutilizar este código sem revisão.
+
+----------------------------------------------------------------------
+Conteúdo original abaixo, preservado como referência:
 
 Fluxo:
   Webhook Zabbix/K8s → este script → Claude API (com MCP tools) → Slack/Telegram/Google Chat
@@ -12,11 +42,8 @@ Fluxo:
 Dependências:
   pip install anthropic httpx python-dotenv
 
-Uso:
-  # Servidor HTTP (recebe webhooks)
+Uso (histórico):
   python agent_orchestrator.py --mode server --port 9000
-
-  # Teste manual com payload simulado
   python agent_orchestrator.py --mode test --source zabbix
   python agent_orchestrator.py --mode test --source kubernetes
 """

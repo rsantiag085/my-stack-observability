@@ -149,7 +149,6 @@ observability/
 │   ├── health-check.sh
 │   ├── reset-lab.sh
 │   ├── import-dashboards.sh   ← Importa dashboards JSON para o Grafana via API (setup fresh)
-│   ├── agent_orchestrator.py  ← Agente orquestrador (webhook → Claude + MCP → Telegram/Google Chat)
 │   └── zabbix_agent.py        ← Agente autônomo de incidentes Zabbix (Gemini Flash + MCP → SSH → Telegram)
 └── docs/
     ├── setup-guide.md         ← Guia completo de setup do zero (público)
@@ -157,6 +156,7 @@ observability/
     ├── gen_diagram.py         ← Script para gerar homelab-diagram.png (Pillow)
     ├── homelab-diagram.dot    ← Fonte Graphviz do diagrama (referência)
     ├── hosts.md               ← Inventário do HomeLAB Proxmox (IPs internos — local)
+    ├── archive/               ← Protótipos aposentados (ex: agent_orchestrator.py v1)
     ├── postmortem/            ← Postmortems de incidentes (local)
     └── runbooks/              ← Runbooks de troubleshooting RB-001 a RB-004 (local)
 ```

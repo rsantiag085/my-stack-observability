@@ -258,7 +258,7 @@ Agente de resposta a incidentes que roda na **workstation** (`192.168.10.108`), 
 
 **Ação autônoma principal:** ao detectar `agent is not available`, reinicia o `zabbix-agent2` no host afetado via SSH como a conta de serviço `svc-zabbix` (sudo NOPASSWD restrito a `systemctl {start,stop,restart,status} zabbix-agent2`). A conta existe nas 6 VMs do inventário (104, 112, 210, 202, 203, 204).
 
-> Predecessor: `agent_orchestrator.py` (v1) — webhook → Claude API + MCP → Telegram/Google Chat. Mantido no repositório como referência; o `zabbix_agent.py` é a implementação ativa. Setup completo na seção 17 do `docs/setup-guide.md`.
+> Predecessor: `docs/archive/agent_orchestrator.py` (v1) — webhook → Claude API + MCP **remoto** → Telegram/Google Chat. Protótipo aposentado (MCP remoto não alcança IP privado do HomeLAB); nunca rodou em produção. Arquivado como registro histórico; o `zabbix_agent.py` é a implementação ativa. Setup completo na seção 17 do `docs/setup-guide.md`.
 
 ---
 
@@ -350,7 +350,7 @@ Prometheus ◄── Zabbix Exporter ◄── Zabbix Server
 - **Port-forwards e DNAT persistentes** ✅ — serviços systemd na VM `docker` (2026-05-29)
 - **Kubernetes MCP Server** ✅ — v0.0.62 instalado em `mcp-server:8081` (2026-05-29)
 - **AGENT.md** ✅ — especificação do agente autônomo de SRE (guardrails, fluxo, criticidade por host); atualizado para v2.0.0 (2026-06-10)
-- **agent_orchestrator.py** ✅ — agente v1: webhook HTTP → Claude API + MCP → Telegram/Google Chat (2026-05-29)
+- **agent_orchestrator.py** 📦 — agente v1 (protótipo Claude API + MCP remoto); aposentado e movido para `docs/archive/` em 2026-06-11 (nunca rodou; MCP remoto incompatível com rede privada)
 - **zabbix_agent.py** ✅ — agente v2: webhook → Gemini Flash 2.5 + MCP Zabbix + restart via SSH (`svc-zabbix`) → Telegram; ack após 60s (2026-06-10)
 - **`focustrack` no Minikube** — manifestos K8s + instrumentação OTEL
 - Alertmanager (roteamento de alertas)
@@ -407,7 +407,7 @@ ssh 192.168.10.204   # zabbix-proxy
 | `graphviz_guide.md` | Documentação do experimento GraphViz no Grafana 13 |
 | `CLAUDE.md` | Instruções locais para agentes de IA — não versionado (`.gitignore`) |
 | `AGENT.md` | Especificação do agente autônomo de SRE — guardrails, fluxo, inventário de criticidade |
-| `scripts/agent_orchestrator.py` | Agente v1 — webhook → Claude API + MCP → Telegram/Google Chat (referência) |
+| `docs/archive/agent_orchestrator.py` | Agente v1 — protótipo Claude API + MCP remoto, aposentado (registro histórico) |
 | `scripts/zabbix_agent.py` | Agente v2 (ativo) — webhook → Gemini Flash + MCP Zabbix + SSH → Telegram |
 | `.env.example` | Template das variáveis da stack de observabilidade |
 | `.env.mcp-server.example` | Template das variáveis do MCP Server |

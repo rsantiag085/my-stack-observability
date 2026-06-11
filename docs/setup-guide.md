@@ -331,8 +331,8 @@ observability/
 │   ├── health-check.sh                 # Valida os 6 endpoints de saúde
 │   ├── import-dashboards.sh            # Importa JSONs via API do Grafana (setup fresh)
 │   ├── reset-lab.sh                    # Destrói e recria o lab do zero (DESTRUTIVO)
-│   ├── agent_orchestrator.py           # Agente SRE v1: webhook → Claude API + MCP (legado)
 │   └── zabbix_agent.py                 # Agente SRE v2: webhook → Gemini Flash + MCP Zabbix + SSH
+│                                       # (v1 agent_orchestrator.py aposentado em docs/archive/)
 │
 └── docs/                               # Documentação
     ├── hosts.md                        # Inventário detalhado das VMs
