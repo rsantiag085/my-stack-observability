@@ -288,6 +288,7 @@ uma tag própria, e a triagem do humano está no **RB-006**:
 | Instalação do Kubernetes MCP | `docs/runbooks/RB-004-instalacao-kubernetes-mcp-server.md` |
 | Serviços K8s offline na VM docker | `docs/runbooks/RB-005-servicos-k8s-docker-vm.md` |
 | **Agente autônomo escalou — triagem do handoff** | `docs/runbooks/RB-006-handoff-agente-autonomo.md` |
+| RBAC least-privilege do agente (produção) | `docs/runbooks/RB-007-rbac-least-privilege-producao.md` |
 
 ---
 
