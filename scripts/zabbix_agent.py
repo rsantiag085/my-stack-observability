@@ -2,7 +2,7 @@
 """
 zabbix_agent.py — Agente Autônomo de Incidentes Zabbix
 =======================================================
-Versão   : 2.2.0
+Versão   : 2.3.0
 Criado em: 2026-06-10
 
 Guardrails de atuador em CÓDIGO (não só no prompt):
@@ -10,6 +10,11 @@ Guardrails de atuador em CÓDIGO (não só no prompt):
   - script_execute: allowlist de scriptid (fail-closed via ZABBIX_ALLOWED_SCRIPT_IDS)
   - webhook: secret em tempo constante + cap de tamanho de corpo
   - process_incident resiliente: falha sempre vira notificação de escalação
+
+Resiliência & concorrência (v2.3.0):
+  - fila + pool de workers limitado (back-pressure 503); idempotência por eventid
+  - deadline por chamada e por incidente; circuit breaker de quota (429)
+  - scheduler dedicado para a espera de persistência (fora do pool de workers)
 
 Fluxo:
   Webhook Zabbix → Gemini Flash → MCP Zabbix server → ferramentas Zabbix → Telegram
@@ -27,7 +32,9 @@ Uso:
 
 import argparse
 import asyncio
+import heapq
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -102,6 +109,10 @@ AGENT_QUEUE_MAX    = int(os.getenv("AGENT_QUEUE_MAX", "50"))
 
 # Idempotência — janela (s) em que um eventid já processado é ignorado se reentregue
 DEDUP_TTL          = int(os.getenv("DEDUP_TTL", "600"))
+
+# Espera de persistência (s) antes de assumir o incidente — feita FORA do pool
+# de workers, por uma thread scheduler dedicada (não ocupa slot de worker).
+PERSISTENCE_WAIT   = int(os.getenv("PERSISTENCE_WAIT", "60"))
 
 SSH_USER           = os.getenv("SSH_USER", "svc-zabbix")
 SSH_KEY_PATH       = os.getenv("SSH_KEY_PATH", str(Path.home() / ".ssh" / "homelab_ed25519"))
@@ -871,39 +882,9 @@ def process_incident(payload: dict) -> None:
 
 
 def _process_incident(payload: dict) -> None:
+    # A espera de persistência e o acknowledge já aconteceram no scheduler antes
+    # de chegar aqui (ver _on_scheduled_due). O worker só faz a investigação.
     log.info(f"Processando: {payload.get('problem')} | host: {payload.get('host')}")
-
-    eventid = str(payload.get("eventid", ""))
-    valid_event = bool(eventid and eventid not in ("", "N/A", "99999"))
-
-    if valid_event:
-        # Aguarda 60s para confirmar que o incidente persiste antes de reconhecer
-        log.info(f"Aguardando 60s para confirmar persistência — eventid {eventid}")
-        time.sleep(60)
-
-        try:
-            check = asyncio.run(_mcp_call_tool("problem_active_get", {"eventids": [eventid]}))
-            still_active = eventid in check
-        except Exception as e:
-            log.warning(f"Verificação de persistência falhou: {e} — prosseguindo")
-            still_active = True
-
-        if not still_active:
-            log.info(f"Incidente {eventid} resolvido em menos de 1min — descartando")
-            return
-
-        try:
-            asyncio.run(_mcp_call_tool("event_acknowledge", {
-                "eventids": [eventid],
-                "action": 6,
-                "message": (
-                    f"🤖 *Agente autônomo assumiu* — investigando...\n"
-                    f"Host: {payload.get('host')} | Severidade: {payload.get('severity')}"
-                ),
-            }))
-            log.info(f"Acknowledge enviado após 60s — eventid {eventid}")
-        except Exception as e:
-            log.warning(f"Acknowledge falhou: {e}")
 
     result = run_agent(payload)
 
@@ -988,11 +969,100 @@ def start_workers() -> None:
     log.info(f"Pool de workers iniciado: {AGENT_WORKERS} workers | fila máx {AGENT_QUEUE_MAX}")
 
 
-def enqueue_incident(payload: dict) -> str:
+def _enqueue_work(payload: dict) -> bool:
+    """Coloca o incidente na fila dos workers. False se cheia. Não faz dedup."""
+    try:
+        _WORK_Q.put_nowait(payload)
+        return True
+    except queue.Full:
+        return False
+
+# ---------------------------------------------------------------------------
+# Scheduler — espera de persistência FORA do pool de workers
+# ---------------------------------------------------------------------------
+# A confirmação de persistência (~60s) e o acknowledge não devem ocupar um slot
+# de worker. Uma thread scheduler dedicada segura os incidentes até a hora,
+# confirma persistência + faz o ack, e só então os promove à fila dos workers.
+
+_sched_cv = threading.Condition()
+_sched_heap: list = []                 # (run_at, seq, payload)
+_sched_seq = itertools.count()
+
+
+def schedule_after(delay_s: float, payload: dict) -> None:
+    """Agenda o incidente para promoção à fila dos workers daqui a delay_s."""
+    run_at = time.time() + delay_s
+    with _sched_cv:
+        heapq.heappush(_sched_heap, (run_at, next(_sched_seq), payload))
+        _sched_cv.notify()
+
+
+def _on_scheduled_due(payload: dict) -> None:
+    """Chamado pelo scheduler quando a espera termina: confirma persistência,
+    faz o ack e promove o incidente à fila dos workers (ou descarta/escala)."""
+    eventid = str(payload.get("eventid", "")).strip()
+
+    try:
+        check = asyncio.run(_mcp_call_tool("problem_active_get", {"eventids": [eventid]}))
+        still_active = eventid in check
+    except Exception as e:
+        log.warning(f"Verificação de persistência falhou: {e} — prosseguindo")
+        still_active = True
+
+    if not still_active:
+        log.info(f"Incidente {eventid} resolvido em < {PERSISTENCE_WAIT}s — descartando")
+        _mark_done(eventid)
+        return
+
+    try:
+        asyncio.run(_mcp_call_tool("event_acknowledge", {
+            "eventids": [eventid],
+            "action": 6,
+            "message": (
+                f"🤖 *Agente autônomo assumiu* — investigando...\n"
+                f"Host: {payload.get('host')} | Severidade: {payload.get('severity')}"
+            ),
+        }))
+        log.info(f"Acknowledge enviado após {PERSISTENCE_WAIT}s — eventid {eventid}")
+    except Exception as e:
+        log.warning(f"Acknowledge falhou: {e}")
+
+    if not _enqueue_work(payload):
+        log.warning(f"Fila cheia ao promover incidente {eventid} — escalando")
+        _mark_done(eventid)
+        notify(
+            f"🔴 *[ESCALADO — FILA CHEIA]*\n"
+            f"Incidente em `{payload.get('host')}` não pôde ser processado (fila saturada).\n"
+            f"Problema: {payload.get('problem')}\nAção necessária: investigação manual."
+        )
+
+
+def _scheduler_loop() -> None:
+    """Thread única: dorme até o próximo incidente vencer e o processa."""
+    log.info("Scheduler de persistência iniciado")
+    while True:
+        with _sched_cv:
+            while not _sched_heap:
+                _sched_cv.wait()
+            run_at, _, payload = _sched_heap[0]
+            now = time.time()
+            if run_at > now:
+                _sched_cv.wait(timeout=run_at - now)
+                continue  # re-checa: o topo do heap pode ter mudado
+            heapq.heappop(_sched_heap)
+        _on_scheduled_due(payload)
+
+
+def start_scheduler() -> None:
+    threading.Thread(target=_scheduler_loop, daemon=True).start()
+
+
+def submit_incident(payload: dict) -> str:
     """
-    Enfileira um incidente. Retorna:
-      "enqueued"  — aceito na fila
-      "duplicate" — eventid em processamento ou concluído há < DEDUP_TTL (ignorado)
+    Ponto de entrada do webhook. Retorna:
+      "scheduled" — aguardará PERSISTENCE_WAIT antes de ir aos workers (evento real)
+      "enqueued"  — foi direto para os workers (evento de teste/sem id)
+      "duplicate" — eventid já em processamento ou concluído há < DEDUP_TTL
       "full"      — fila cheia (back-pressure)
     """
     eventid = str(payload.get("eventid", "")).strip()
@@ -1002,15 +1072,12 @@ def enqueue_incident(payload: dict) -> str:
             if eventid in _inflight or eventid in _recent:
                 return "duplicate"
             _inflight.add(eventid)
-    try:
-        _WORK_Q.put_nowait(payload)
-        return "enqueued"
-    except queue.Full:
-        # Rollback do inflight se não conseguiu enfileirar
-        if _is_dedup_candidate(eventid):
-            with _dedup_lock:
-                _inflight.discard(eventid)
-        return "full"
+        # Espera de persistência fora do pool; promoção à fila acontece depois.
+        schedule_after(PERSISTENCE_WAIT, payload)
+        return "scheduled"
+
+    # Evento de teste/sem id → direto aos workers, sem espera nem dedup.
+    return "enqueued" if _enqueue_work(payload) else "full"
 
 # ---------------------------------------------------------------------------
 # Servidor webhook
@@ -1052,7 +1119,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             log.error(f"Payload inválido: {body[:200]}")
             return
 
-        status = enqueue_incident(payload)
+        status = submit_incident(payload)
 
         if status == "full":
             self.send_response(503)
@@ -1070,7 +1137,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b'{"status": "accepted"}')
+        self.wfile.write(f'{{"status": "{status}"}}'.encode())
 
     def log_message(self, fmt, *args):
         log.info(f"HTTP {self.client_address[0]} — {fmt % args}")
@@ -1079,6 +1146,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 def start_server(port: int) -> None:
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     start_workers()
+    start_scheduler()
     log.info(f"Zabbix Agent iniciado — escutando em 0.0.0.0:{port}")
     log.info(f"Modelo: {GEMINI_MODEL} | MCP: {ZABBIX_MCP_URL}")
     if not WEBHOOK_SECRET:

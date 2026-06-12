@@ -1,6 +1,6 @@
 # AGENT.md — Agente Autônomo de Resposta a Incidentes
 
-> **Versão:** 2.2.0  
+> **Versão:** 2.3.0  
 > **Criado em:** 2026-05-29 | **Atualizado em:** 2026-06-11  
 > **Ambiente:** HomeLAB ProxMox — `192.168.10.0/24`  
 > **Implementação:** `scripts/zabbix_agent.py` — Gemini Flash 2.5 + MCP Zabbix + Loki  
@@ -324,6 +324,7 @@ cp docs/postmortem/postmortem.md \
 
 | Versão | Data | Alteração |
 |---|---|---|
+| 2.3.0 | 2026-06-11 | Resiliência & concorrência: fila + pool de workers limitado (back-pressure 503), idempotência por `eventid`, deadline por chamada/incidente, circuit breaker de quota (429), scheduler dedicado para a espera de persistência (fora do pool). Tudo stdlib; estado em memória (produção exige store externo) |
 | 2.2.0 | 2026-06-11 | Guardrails de atuador em código (não só prompt): allowlist de HOST no `ssh_execute` (nega `zabbix-db` e hosts fora do inventário), allowlist de `scriptid` no `script_execute` (fail-closed via `ZABBIX_ALLOWED_SCRIPT_IDS`); webhook com `compare_digest` + cap de corpo (256 KB); `process_incident` resiliente (falha sempre vira notificação de escalação) |
 | 2.1.0 | 2026-06-11 | Correlação log × métrica (RCA): ferramenta `loki_query_range` (Loki HTTP), fase `[3.5] CORRELACIONAR` no fluxo, JSON de saída enriquecido (`root_cause`, `correlation_evidence`, `confidence`); postmortem e incident-log passam a registrar causa raiz e timeline |
 | 2.0.0 | 2026-06-10 | Implementação real em `zabbix_agent.py` (Gemini Flash 2.5 + MCP Zabbix); ferramenta `ssh_execute`; conta `svc-zabbix`; acknowledge após 60s; padrões conhecidos de incidente; runbooks carregados integralmente |
