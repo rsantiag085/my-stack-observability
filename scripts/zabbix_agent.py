@@ -2,8 +2,14 @@
 """
 zabbix_agent.py — Agente Autônomo de Incidentes Zabbix
 =======================================================
-Versão   : 2.0.0
+Versão   : 2.2.0
 Criado em: 2026-06-10
+
+Guardrails de atuador em CÓDIGO (não só no prompt):
+  - ssh_execute: allowlist de host (nega zabbix-db e hosts fora do inventário) + de comando
+  - script_execute: allowlist de scriptid (fail-closed via ZABBIX_ALLOWED_SCRIPT_IDS)
+  - webhook: secret em tempo constante + cap de tamanho de corpo
+  - process_incident resiliente: falha sempre vira notificação de escalação
 
 Fluxo:
   Webhook Zabbix → Gemini Flash → MCP Zabbix server → ferramentas Zabbix → Telegram
@@ -21,6 +27,7 @@ Uso:
 
 import argparse
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -111,6 +118,32 @@ SSH_ALLOWED_COMMANDS = {
     "systemctl status zabbix-agent",
 }
 
+# Hosts onde ssh_execute pode atuar — espelha o inventário do AGENT.md §7 / docs/hosts.md.
+# Guardrail em CÓDIGO: o LLM propõe o host_ip, mas só estes são autorizados.
+SSH_ALLOWED_HOSTS = {
+    "192.168.10.104",  # ansible
+    "192.168.10.112",  # docker
+    "192.168.10.210",  # mcp-server
+    "192.168.10.202",  # zabbix-server
+    "192.168.10.203",  # zabbix-front
+    "192.168.10.204",  # zabbix-proxy
+}
+# zabbix-db é deliberadamente EXCLUÍDO da allowlist — criticidade crítica,
+# nenhuma ação autônoma (AGENT.md §3.3). Listado à parte para mensagem de erro clara.
+SSH_DENIED_HOSTS = {
+    "192.168.10.201",  # zabbix-db
+}
+
+# Scripts Zabbix que o agente pode executar autonomamente (IDs separados por vírgula
+# no .env.zabbix-agent). VAZIO = nenhum script permitido (fail-closed): script_execute
+# fica bloqueado em código até o operador habilitar IDs específicos.
+ZABBIX_ALLOWED_SCRIPT_IDS = {
+    s.strip() for s in os.getenv("ZABBIX_ALLOWED_SCRIPT_IDS", "").split(",") if s.strip()
+}
+
+# Tamanho máximo do corpo do webhook — payload de incidente é pequeno (anti-DoS).
+MAX_BODY_BYTES = 256 * 1024  # 256 KB
+
 AGENT_MD_PATH      = Path(__file__).parent.parent / "AGENT.md"
 HOSTS_MD_PATH      = Path(__file__).parent.parent / "docs" / "hosts.md"
 RUNBOOKS_PATH      = Path(__file__).parent.parent / "docs" / "runbooks"
@@ -190,7 +223,23 @@ _SSH_TOOL_DECLARATION = genai.protos.FunctionDeclaration(
 
 
 def _ssh_run(host_ip: str, command: str) -> str:
+    host_ip = host_ip.strip()
     command = command.strip()
+    # Guardrail de host (antes do comando): nunca atuar no zabbix-db nem em host
+    # fora do inventário — a proibição do AGENT.md vira regra de código, não só prompt.
+    if host_ip in SSH_DENIED_HOSTS:
+        log.warning(f"SSH BLOQUEADO → host crítico {host_ip} (zabbix-db)")
+        return (
+            f"ERRO: host {host_ip} é de criticidade crítica (zabbix-db) — "
+            "ação autônoma proibida pelo AGENT.md §3.3. Escale para o SRE."
+        )
+    if host_ip not in SSH_ALLOWED_HOSTS:
+        log.warning(f"SSH BLOQUEADO → host fora do inventário: {host_ip}")
+        allowed_hosts = ", ".join(sorted(SSH_ALLOWED_HOSTS))
+        return (
+            f"ERRO: host {host_ip} fora do inventário autorizado. "
+            f"Hosts permitidos: {allowed_hosts}. Escale para o SRE."
+        )
     if command not in SSH_ALLOWED_COMMANDS:
         allowed = ", ".join(sorted(SSH_ALLOWED_COMMANDS))
         return f"ERRO: Comando não permitido: {command!r}\nPermitidos: {allowed}"
@@ -301,6 +350,35 @@ def _loki_query_range(query: str, minutes: int = 15, end_iso: str = "", limit: i
         omitted = len(rendered) - 80
         rendered = rendered[:40] + [f"... ({omitted} linhas omitidas) ..."] + rendered[-40:]
     return "\n".join(rendered)
+
+# ---------------------------------------------------------------------------
+# Guardrail de script_execute — atuador privilegiado do Zabbix
+# ---------------------------------------------------------------------------
+
+def _script_execute_guard(args: dict) -> str | None:
+    """
+    Autoriza (ou não) uma chamada de script_execute ANTES de ela chegar ao MCP.
+    Retorna uma mensagem de ERRO se a execução for proibida, ou None se permitida.
+
+    Fail-closed: sem ZABBIX_ALLOWED_SCRIPT_IDS definido, nenhum script é executável.
+    O LLM propõe o script; o código autoriza.
+    """
+    scriptid = str(args.get("scriptid", "")).strip()
+    if not ZABBIX_ALLOWED_SCRIPT_IDS:
+        log.warning("script_execute BLOQUEADO → allowlist vazia (fail-closed)")
+        return (
+            "ERRO: script_execute está desabilitado — nenhum script na allowlist. "
+            "Defina ZABBIX_ALLOWED_SCRIPT_IDS no .env.zabbix-agent para habilitar "
+            "scripts específicos. Escale para o SRE."
+        )
+    if scriptid not in ZABBIX_ALLOWED_SCRIPT_IDS:
+        log.warning(f"script_execute BLOQUEADO → scriptid {scriptid!r} fora da allowlist")
+        allowed = ", ".join(sorted(ZABBIX_ALLOWED_SCRIPT_IDS))
+        return (
+            f"ERRO: scriptid {scriptid!r} não está autorizado. "
+            f"Scripts permitidos: {allowed}. Escale para o SRE."
+        )
+    return None
 
 # ---------------------------------------------------------------------------
 # Carregamento de contexto
@@ -538,6 +616,10 @@ def run_agent(payload: dict) -> dict:
                         args.get("end_iso", ""),
                         int(args.get("limit", 100) or 100),
                     )
+                elif fc.name == "script_execute":
+                    # Atuador privilegiado: autorizar em código antes de tocar o MCP.
+                    denial = _script_execute_guard(args)
+                    result_text = denial if denial else asyncio.run(_mcp_call_tool(fc.name, args))
                 else:
                     result_text = asyncio.run(_mcp_call_tool(fc.name, args))
                 log.info(f"[TURN {turn + 1}] ← {fc.name} OK")
@@ -649,6 +731,26 @@ def create_postmortem(payload: dict, diagnosis: str) -> Path | None:
 # ---------------------------------------------------------------------------
 
 def process_incident(payload: dict) -> None:
+    """
+    Wrapper resiliente: garante que qualquer falha não tratada no pipeline ainda
+    gere uma notificação de escalação. Sem isso, uma exceção em create_postmortem
+    ou log_incident morreria silenciosa na thread daemon — depois de o agente já
+    ter dado acknowledge no evento, deixando o incidente mascarado no Zabbix.
+    """
+    try:
+        _process_incident(payload)
+    except Exception as e:
+        log.exception(f"Falha não tratada no pipeline de incidente: {e}")
+        notify(
+            f"🔴 *[FALHA DO AGENTE]*\n"
+            f"Erro não tratado ao processar incidente em `{payload.get('host')}`\n"
+            f"Problema: {payload.get('problem')}\n"
+            f"Motivo: `{e}`\n"
+            f"Ação necessária: verificação manual imediata."
+        )
+
+
+def _process_incident(payload: dict) -> None:
     log.info(f"Processando: {payload.get('problem')} | host: {payload.get('host')}")
 
     eventid = str(payload.get("eventid", ""))
@@ -713,14 +815,30 @@ def process_incident(payload: dict) -> None:
 class WebhookHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
-        if WEBHOOK_SECRET and self.headers.get("X-Webhook-Secret", "") != WEBHOOK_SECRET:
+        # Comparação em tempo constante — evita timing side-channel no secret.
+        if WEBHOOK_SECRET and not hmac.compare_digest(
+            self.headers.get("X-Webhook-Secret", ""), WEBHOOK_SECRET
+        ):
             self.send_response(401)
             self.end_headers()
             log.warning(f"Webhook rejeitado — secret inválido de {self.client_address[0]}")
             return
 
-        length  = int(self.headers.get("Content-Length", 0))
-        body    = self.rfile.read(length)
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self.send_response(400)
+            self.end_headers()
+            log.error("Content-Length inválido no webhook")
+            return
+
+        if length <= 0 or length > MAX_BODY_BYTES:
+            self.send_response(413)
+            self.end_headers()
+            log.warning(f"Payload rejeitado — Content-Length {length} (máx {MAX_BODY_BYTES})")
+            return
+
+        body = self.rfile.read(length)
 
         try:
             payload = json.loads(body)
@@ -745,6 +863,12 @@ def start_server(port: int) -> None:
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     log.info(f"Zabbix Agent iniciado — escutando em 0.0.0.0:{port}")
     log.info(f"Modelo: {GEMINI_MODEL} | MCP: {ZABBIX_MCP_URL}")
+    if not WEBHOOK_SECRET:
+        log.warning("⚠️  WEBHOOK_SECRET não definido — endpoint SEM autenticação. "
+                    "Defina no .env.zabbix-agent antes de expor o serviço.")
+    if not ZABBIX_ALLOWED_SCRIPT_IDS:
+        log.info("script_execute desabilitado (allowlist vazia) — defina "
+                 "ZABBIX_ALLOWED_SCRIPT_IDS para habilitar.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

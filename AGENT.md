@@ -1,6 +1,6 @@
 # AGENT.md — Agente Autônomo de Resposta a Incidentes
 
-> **Versão:** 2.1.0  
+> **Versão:** 2.2.0  
 > **Criado em:** 2026-05-29 | **Atualizado em:** 2026-06-11  
 > **Ambiente:** HomeLAB ProxMox — `192.168.10.0/24`  
 > **Implementação:** `scripts/zabbix_agent.py` — Gemini Flash 2.5 + MCP Zabbix + Loki  
@@ -66,7 +66,11 @@ Ferramenta customizada `ssh_execute` (implementada no agente, não via MCP):
 - `sudo systemctl stop zabbix-agent`
 - `sudo systemctl status zabbix-agent`
 
+**Allowlist de HOST (guardrail em código — `SSH_ALLOWED_HOSTS`):** o `host_ip` proposto pelo LLM é validado antes da execução. Permitidos: `104, 112, 210, 202, 203, 204`. **`zabbix-db` (`192.168.10.201`) e qualquer host fora do inventário são negados em código** — a proibição do §3.3 não depende do prompt.
+
 **Conta de serviço:** `svc-zabbix` — sem senha, autenticação por chave `homelab_ed25519`, sudoers NOPASSWD restrito ao allowlist acima. Criada em: `ansible` (104), `docker` (112), `mcp-server` (210), `zabbix-server` (202), `zabbix-front` (203), `zabbix-proxy` (204).
+
+**`script_execute` — atuador privilegiado (guardrail em código):** allowlist de `scriptid` via `ZABBIX_ALLOWED_SCRIPT_IDS` (no `.env.zabbix-agent`). **Fail-closed:** com a variável vazia, nenhum script é executável — o agente devolve erro e escala. O LLM propõe o script; o código autoriza.
 
 ### 2.3 Loki — `http://192.168.10.104:3100` (correlação log × métrica)
 
@@ -320,6 +324,7 @@ cp docs/postmortem/postmortem.md \
 
 | Versão | Data | Alteração |
 |---|---|---|
+| 2.2.0 | 2026-06-11 | Guardrails de atuador em código (não só prompt): allowlist de HOST no `ssh_execute` (nega `zabbix-db` e hosts fora do inventário), allowlist de `scriptid` no `script_execute` (fail-closed via `ZABBIX_ALLOWED_SCRIPT_IDS`); webhook com `compare_digest` + cap de corpo (256 KB); `process_incident` resiliente (falha sempre vira notificação de escalação) |
 | 2.1.0 | 2026-06-11 | Correlação log × métrica (RCA): ferramenta `loki_query_range` (Loki HTTP), fase `[3.5] CORRELACIONAR` no fluxo, JSON de saída enriquecido (`root_cause`, `correlation_evidence`, `confidence`); postmortem e incident-log passam a registrar causa raiz e timeline |
 | 2.0.0 | 2026-06-10 | Implementação real em `zabbix_agent.py` (Gemini Flash 2.5 + MCP Zabbix); ferramenta `ssh_execute`; conta `svc-zabbix`; acknowledge após 60s; padrões conhecidos de incidente; runbooks carregados integralmente |
 | 1.0.0 | 2026-05-29 | Criação inicial — autonomia nível 2 (diagnóstico + ações seguras) |
