@@ -127,7 +127,7 @@ Endpoint: `GET /loki/api/v1/query_range`. Operação **somente leitura** — nen
 
 ### 3.3 Ações que exigem aprovação humana — PARAR e notificar
 
-> **Nunca executar estas ações de forma autônoma.** Notificar o SRE via Telegram/Google Chat e aguardar.
+> **Nunca executar estas ações de forma autônoma.** Notificar o SRE via Telegram e aguardar.
 
 - Qualquer ação no host `zabbix-db` (`192.168.10.201`)
 - `resources_scale` com destino `0` réplicas
@@ -185,11 +185,8 @@ Endpoint: `GET /loki/api/v1/query_range`. Operação **somente leitura** — nen
     └── Não resolvido → notificar SRE (passo 6) e escalar
 
 [6] NOTIFICAR
-    Enviar mensagem Telegram e/ou Google Chat com o relatório estruturado (ver seção 5)
-    └── Canal configurado via NOTIFICATION_CHANNEL no .env.agent
-        telegram    → apenas Telegram
-        google_chat → apenas Google Chat (produção)
-        both        → ambos simultaneamente
+    Enviar mensagem Telegram com o relatório estruturado (ver seção 5)
+    └── Configurado via TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID no .env.zabbix-agent
 
 [7] DOCUMENTAR
     Registrar no log do agente:
@@ -202,7 +199,10 @@ Endpoint: `GET /loki/api/v1/query_range`. Operação **somente leitura** — nen
 
 ---
 
-## 5. Formato de notificação (Telegram / Google Chat)
+## 5. Formato de notificação (Telegram)
+
+> O JSON de resposta do agente carrega `root_cause`, `correlation_evidence` (timeline log × métrica)
+> e `confidence`. A `notification_message` deve refletir esses campos.
 
 ### Incidente diagnosticado e resolvido autonomamente
 
@@ -211,19 +211,19 @@ Endpoint: `GET /loki/api/v1/query_range`. Operação **somente leitura** — nen
 
 *Problema:* <descrição do trigger Zabbix ou evento K8s>
 *Severidade:* <SEV1 / SEV2 / SEV3>
-*Início:* <timestamp>
 *Resolução:* <timestamp> (~Xmin de duração)
 
-*Diagnóstico:*
-<resumo do que foi encontrado — causa raiz identificada>
+*Causa raiz:* <root_cause — explicação que liga log e métrica>
+*Confiança:* <alta | media | baixa>
+
+*Timeline (correlação log × métrica):*
+<correlation_evidence em ordem cronológica, ex:>
+- 13:42:10 — mem.usage do obs-tempo atingiu o mem_limit (Zabbix)
+- 13:42:31 — log "OOMKilled" no container obs-tempo (Loki)
+- 13:42:35 — trigger "Container is not running" disparou
 
 *Ação executada:*
-<o que o agente fez — ex: "Pod obs-loki deletado e recriado (CrashLoopBackOff confirmado por 8min, OOM)">
-
-*Evidências:*
-- Exit code: <valor>
-- Últimas linhas de log: `<trecho relevante>`
-- Métrica no momento: <valor>
+<o que o agente fez>
 
 *Próximo passo recomendado:*
 <ex: "Revisar mem_limit do container no docker-compose.yml">
@@ -265,6 +265,17 @@ Endpoint: `GET /loki/api/v1/query_range`. Operação **somente leitura** — nen
 *Aguardando:* instrução do SRE
 ```
 
+### Escalações automáticas por limite de resiliência (v2.3.0)
+
+O agente também escala — sem diagnóstico — quando bate num limite operacional. Cada caso tem
+uma tag própria, e a triagem do humano está no **RB-006**:
+
+```
+🟡 *[ESCALADO — DEADLINE]*       investigação excedeu INCIDENT_DEADLINE e foi interrompida
+🔴 *[ESCALADO — LLM INDISPONÍVEL]*  circuit breaker aberto (quota Gemini esgotada, 429)
+🔴 *[ESCALADO — FILA CHEIA]*     pool saturado (tempestade de alertas) — incidente não processado
+```
+
 ---
 
 ## 6. Runbooks de referência
@@ -275,6 +286,8 @@ Endpoint: `GET /loki/api/v1/query_range`. Operação **somente leitura** — nen
 | Container caído no host ansible | `docs/runbooks/RB-002-stack-observabilidade.md` |
 | Zabbix Agent indisponível | `docs/runbooks/RB-003-zabbix-agent-indisponivel.md` |
 | Instalação do Kubernetes MCP | `docs/runbooks/RB-004-instalacao-kubernetes-mcp-server.md` |
+| Serviços K8s offline na VM docker | `docs/runbooks/RB-005-servicos-k8s-docker-vm.md` |
+| **Agente autônomo escalou — triagem do handoff** | `docs/runbooks/RB-006-handoff-agente-autonomo.md` |
 
 ---
 
@@ -315,7 +328,7 @@ cp docs/postmortem/postmortem.md \
 - **Não é um sistema de monitoramento** — ele reage a alertas, não os cria
 - **Não substitui o SRE** — escala tudo que não tem evidência clara
 - **Não tem memória entre execuções** — cada incidente começa do zero com contexto fresco
-- **Não age em silêncio** — toda ação gera notificação Telegram/Google Chat, sem exceção
+- **Não age em silêncio** — toda ação gera notificação Telegram, sem exceção
 - **Não improvisa** — se não há runbook e a causa não é clara, escala
 
 ---
