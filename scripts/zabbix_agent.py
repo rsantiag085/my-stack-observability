@@ -31,8 +31,10 @@ import hmac
 import json
 import logging
 import os
+import queue
 import re
 import sys
+import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -83,6 +85,10 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 WEBHOOK_PORT       = int(os.getenv("WEBHOOK_PORT", "9001"))
 WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "")
+
+# Concorrência — pool de workers limitado (anti-tempestade de alertas)
+AGENT_WORKERS      = int(os.getenv("AGENT_WORKERS", "2"))
+AGENT_QUEUE_MAX    = int(os.getenv("AGENT_QUEUE_MAX", "50"))
 
 SSH_USER           = os.getenv("SSH_USER", "svc-zabbix")
 SSH_KEY_PATH       = os.getenv("SSH_KEY_PATH", str(Path.home() / ".ssh" / "homelab_ed25519"))
@@ -809,6 +815,45 @@ def _process_incident(payload: dict) -> None:
     log_incident(payload, result)
 
 # ---------------------------------------------------------------------------
+# Fila de trabalho + pool de workers — limita a concorrência
+# ---------------------------------------------------------------------------
+# Antes, cada webhook criava uma thread daemon sem limite: uma tempestade de
+# alertas viraria explosão de threads + estouro de quota do Gemini. Agora os
+# incidentes entram numa fila limitada e são consumidos por um pool fixo de
+# workers. Fila cheia → o webhook responde 503 (back-pressure honesta).
+
+_WORK_Q: "queue.Queue[dict]" = queue.Queue(maxsize=AGENT_QUEUE_MAX)
+
+
+def _worker_loop(worker_id: int) -> None:
+    """Consome incidentes da fila em série. Concorrência total = nº de workers."""
+    log.info(f"Worker {worker_id} iniciado")
+    while True:
+        payload = _WORK_Q.get()
+        try:
+            process_incident(payload)
+        except Exception as e:  # process_incident já é resiliente; isto é o cinto extra
+            log.exception(f"Worker {worker_id} — erro inesperado: {e}")
+        finally:
+            _WORK_Q.task_done()
+
+
+def start_workers() -> None:
+    """Sobe o pool fixo de workers (threads daemon de longa duração)."""
+    for i in range(AGENT_WORKERS):
+        threading.Thread(target=_worker_loop, args=(i + 1,), daemon=True).start()
+    log.info(f"Pool de workers iniciado: {AGENT_WORKERS} workers | fila máx {AGENT_QUEUE_MAX}")
+
+
+def enqueue_incident(payload: dict) -> bool:
+    """Enfileira um incidente. Retorna False se a fila estiver cheia (back-pressure)."""
+    try:
+        _WORK_Q.put_nowait(payload)
+        return True
+    except queue.Full:
+        return False
+
+# ---------------------------------------------------------------------------
 # Servidor webhook
 # ---------------------------------------------------------------------------
 
@@ -848,12 +893,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
             log.error(f"Payload inválido: {body[:200]}")
             return
 
+        if not enqueue_incident(payload):
+            self.send_response(503)
+            self.end_headers()
+            self.wfile.write(b'{"status": "queue_full"}')
+            log.warning(f"Fila cheia ({AGENT_QUEUE_MAX}) — incidente rejeitado (503): {payload.get('problem')}")
+            return
+
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b'{"status": "accepted"}')
-
-        import threading
-        threading.Thread(target=process_incident, args=(payload,), daemon=True).start()
 
     def log_message(self, fmt, *args):
         log.info(f"HTTP {self.client_address[0]} — {fmt % args}")
@@ -861,6 +910,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 def start_server(port: int) -> None:
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
+    start_workers()
     log.info(f"Zabbix Agent iniciado — escutando em 0.0.0.0:{port}")
     log.info(f"Modelo: {GEMINI_MODEL} | MCP: {ZABBIX_MCP_URL}")
     if not WEBHOOK_SECRET:
