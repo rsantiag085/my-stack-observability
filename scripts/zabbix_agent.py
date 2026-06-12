@@ -90,6 +90,9 @@ WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "")
 AGENT_WORKERS      = int(os.getenv("AGENT_WORKERS", "2"))
 AGENT_QUEUE_MAX    = int(os.getenv("AGENT_QUEUE_MAX", "50"))
 
+# Idempotência — janela (s) em que um eventid já processado é ignorado se reentregue
+DEDUP_TTL          = int(os.getenv("DEDUP_TTL", "600"))
+
 SSH_USER           = os.getenv("SSH_USER", "svc-zabbix")
 SSH_KEY_PATH       = os.getenv("SSH_KEY_PATH", str(Path.home() / ".ssh" / "homelab_ed25519"))
 
@@ -824,17 +827,46 @@ def _process_incident(payload: dict) -> None:
 
 _WORK_Q: "queue.Queue[dict]" = queue.Queue(maxsize=AGENT_QUEUE_MAX)
 
+# Idempotência: o Zabbix reentrega o mesmo evento; sem dedup, dois run_agent →
+# possível ação dupla. `_inflight` = eventids em processamento; `_recent` =
+# eventids concluídos há menos de DEDUP_TTL. Ambos sob o mesmo lock.
+_dedup_lock = threading.Lock()
+_inflight: set[str] = set()
+_recent: dict[str, float] = {}
+
+
+def _is_dedup_candidate(eventid: str) -> bool:
+    """Eventos de teste/sem id nunca são deduplicados (sempre processam)."""
+    return bool(eventid) and eventid not in ("", "N/A", "99999")
+
+
+def _prune_recent(now: float) -> None:
+    """Remove eventids cujo TTL expirou. Chamado sob _dedup_lock."""
+    for eid in [e for e, ts in _recent.items() if now - ts > DEDUP_TTL]:
+        del _recent[eid]
+
+
+def _mark_done(eventid: str) -> None:
+    """Worker chama ao terminar: tira de inflight e marca como recente (TTL)."""
+    if not _is_dedup_candidate(eventid):
+        return
+    with _dedup_lock:
+        _inflight.discard(eventid)
+        _recent[eventid] = time.time()
+
 
 def _worker_loop(worker_id: int) -> None:
     """Consome incidentes da fila em série. Concorrência total = nº de workers."""
     log.info(f"Worker {worker_id} iniciado")
     while True:
         payload = _WORK_Q.get()
+        eventid = str(payload.get("eventid", "")).strip()
         try:
             process_incident(payload)
         except Exception as e:  # process_incident já é resiliente; isto é o cinto extra
             log.exception(f"Worker {worker_id} — erro inesperado: {e}")
         finally:
+            _mark_done(eventid)
             _WORK_Q.task_done()
 
 
@@ -845,13 +877,29 @@ def start_workers() -> None:
     log.info(f"Pool de workers iniciado: {AGENT_WORKERS} workers | fila máx {AGENT_QUEUE_MAX}")
 
 
-def enqueue_incident(payload: dict) -> bool:
-    """Enfileira um incidente. Retorna False se a fila estiver cheia (back-pressure)."""
+def enqueue_incident(payload: dict) -> str:
+    """
+    Enfileira um incidente. Retorna:
+      "enqueued"  — aceito na fila
+      "duplicate" — eventid em processamento ou concluído há < DEDUP_TTL (ignorado)
+      "full"      — fila cheia (back-pressure)
+    """
+    eventid = str(payload.get("eventid", "")).strip()
+    if _is_dedup_candidate(eventid):
+        with _dedup_lock:
+            _prune_recent(time.time())
+            if eventid in _inflight or eventid in _recent:
+                return "duplicate"
+            _inflight.add(eventid)
     try:
         _WORK_Q.put_nowait(payload)
-        return True
+        return "enqueued"
     except queue.Full:
-        return False
+        # Rollback do inflight se não conseguiu enfileirar
+        if _is_dedup_candidate(eventid):
+            with _dedup_lock:
+                _inflight.discard(eventid)
+        return "full"
 
 # ---------------------------------------------------------------------------
 # Servidor webhook
@@ -893,11 +941,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
             log.error(f"Payload inválido: {body[:200]}")
             return
 
-        if not enqueue_incident(payload):
+        status = enqueue_incident(payload)
+
+        if status == "full":
             self.send_response(503)
             self.end_headers()
             self.wfile.write(b'{"status": "queue_full"}')
             log.warning(f"Fila cheia ({AGENT_QUEUE_MAX}) — incidente rejeitado (503): {payload.get('problem')}")
+            return
+
+        if status == "duplicate":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status": "duplicate"}')
+            log.info(f"Evento duplicado ignorado — eventid {payload.get('eventid')}: {payload.get('problem')}")
             return
 
         self.send_response(200)
