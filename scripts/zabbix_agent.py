@@ -74,6 +74,11 @@ GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 MAX_TURNS          = 10
 
+# Deadlines — teto de tempo por chamada do Gemini e por incidente inteiro.
+# Sem isto, uma chamada de rede travada pendura o worker indefinidamente.
+LLM_CALL_TIMEOUT   = int(os.getenv("LLM_CALL_TIMEOUT", "60"))    # por chamada send_message
+INCIDENT_DEADLINE  = int(os.getenv("INCIDENT_DEADLINE", "180"))  # wall-clock do incidente
+
 ZABBIX_MCP_URL     = os.getenv("ZABBIX_MCP_URL", "http://192.168.10.210:8080/mcp")
 ZABBIX_MCP_TOKEN   = os.getenv("ZABBIX_MCP_TOKEN", "")
 
@@ -600,10 +605,19 @@ def run_agent(payload: dict) -> dict:
         chat = model.start_chat()
 
         log.info(f"Iniciando ReAct — problema: {payload.get('problem')} | host: {payload.get('host')}")
-        response = chat.send_message(build_incident_prompt(payload))
+        response = chat.send_message(
+            build_incident_prompt(payload),
+            request_options={"timeout": LLM_CALL_TIMEOUT},
+        )
 
         # 3. Loop ReAct: cada tool call abre sua própria conexão MCP
         for turn in range(MAX_TURNS):
+            # Deadline wall-clock: interrompe investigação que se arrasta.
+            if time.time() - start > INCIDENT_DEADLINE:
+                raise TimeoutError(
+                    f"deadline de incidente ({INCIDENT_DEADLINE}s) excedido no turn {turn + 1}"
+                )
+
             function_calls = [
                 p for p in response.parts
                 if hasattr(p, "function_call") and p.function_call.name
@@ -642,7 +656,10 @@ def run_agent(payload: dict) -> dict:
                     )
                 )
 
-            response = chat.send_message(tool_results)
+            response = chat.send_message(
+                tool_results,
+                request_options={"timeout": LLM_CALL_TIMEOUT},
+            )
 
         # 4. Extrair JSON final da resposta
         raw = "".join(
@@ -654,6 +671,23 @@ def run_agent(payload: dict) -> dict:
         except json.JSONDecodeError:
             match = re.search(r'\{[\s\S]+\}', raw)
             result = json.loads(match.group()) if match else {"raw": raw, "escalated": True}
+
+    except TimeoutError as e:
+        log.warning(f"Deadline excedido: {e}")
+        result = {
+            "diagnosis":            f"Investigação interrompida: {e}",
+            "escalated":            True,
+            "escalation_reason":    "Deadline de incidente excedido — investigação parcial",
+            "resolved":             False,
+            "open_postmortem":      True,
+            "postmortem_reason":    "Agente não concluiu o diagnóstico dentro do tempo limite",
+            "notification_message": (
+                f"🟡 *[ESCALADO — DEADLINE]*\n"
+                f"Investigação em `{payload.get('host')}` excedeu {INCIDENT_DEADLINE}s e foi interrompida.\n"
+                f"Problema: {payload.get('problem')}\n"
+                f"Ação necessária: investigação manual."
+            ),
+        }
 
     except Exception as e:
         log.error(f"Erro no agente: {e}")
