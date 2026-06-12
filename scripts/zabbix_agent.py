@@ -79,6 +79,11 @@ MAX_TURNS          = 10
 LLM_CALL_TIMEOUT   = int(os.getenv("LLM_CALL_TIMEOUT", "60"))    # por chamada send_message
 INCIDENT_DEADLINE  = int(os.getenv("INCIDENT_DEADLINE", "180"))  # wall-clock do incidente
 
+# Circuit breaker — após N falhas de quota (429) seguidas, pausa as chamadas ao
+# Gemini por um cooldown e escala direto, em vez de cada incidente falhar lento.
+BREAKER_THRESHOLD  = int(os.getenv("BREAKER_THRESHOLD", "3"))
+BREAKER_COOLDOWN   = int(os.getenv("BREAKER_COOLDOWN", "300"))
+
 ZABBIX_MCP_URL     = os.getenv("ZABBIX_MCP_URL", "http://192.168.10.210:8080/mcp")
 ZABBIX_MCP_TOKEN   = os.getenv("ZABBIX_MCP_TOKEN", "")
 
@@ -580,6 +585,55 @@ def _proto_args_to_dict(value) -> object:
         return [_proto_args_to_dict(v) for v in value]
     return value
 
+# ---------------------------------------------------------------------------
+# Circuit breaker de quota — protege contra rajada de 429 do Gemini
+# ---------------------------------------------------------------------------
+
+_breaker_lock = threading.Lock()
+_breaker = {"fails": 0, "opened_at": 0.0}
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """Detecta 429/quota do Gemini de forma robusta (tipo OU mensagem)."""
+    if type(exc).__name__ in ("ResourceExhausted", "TooManyRequests"):
+        return True
+    text = str(exc).lower()
+    return any(s in text for s in ("429", "resourceexhausted", "quota", "rate limit"))
+
+
+def _breaker_is_open() -> bool:
+    """True se o circuito está aberto (em cooldown). Fecha sozinho ao expirar."""
+    with _breaker_lock:
+        if _breaker["opened_at"] == 0.0:
+            return False
+        if time.time() - _breaker["opened_at"] >= BREAKER_COOLDOWN:
+            _breaker["opened_at"] = 0.0
+            _breaker["fails"] = 0
+            log.info("Circuit breaker fechado — cooldown expirado, retomando chamadas ao Gemini")
+            return False
+        return True
+
+
+def _breaker_record_failure() -> None:
+    """Conta uma falha de quota; abre o circuito ao atingir o threshold."""
+    with _breaker_lock:
+        _breaker["fails"] += 1
+        if _breaker["fails"] >= BREAKER_THRESHOLD and _breaker["opened_at"] == 0.0:
+            _breaker["opened_at"] = time.time()
+            log.warning(
+                f"Circuit breaker ABERTO — {_breaker['fails']} falhas de quota seguidas; "
+                f"pausando chamadas ao Gemini por {BREAKER_COOLDOWN}s"
+            )
+
+
+def _breaker_record_success() -> None:
+    """Sucesso zera o contador e fecha o circuito."""
+    with _breaker_lock:
+        if _breaker["fails"] or _breaker["opened_at"]:
+            log.info("Circuit breaker resetado — chamada bem-sucedida")
+        _breaker["fails"] = 0
+        _breaker["opened_at"] = 0.0
+
 
 def run_agent(payload: dict) -> dict:
     """
@@ -589,6 +643,24 @@ def run_agent(payload: dict) -> dict:
     if not GEMINI_API_KEY:
         log.error("GEMINI_API_KEY não configurada")
         return {"error": "API key ausente", "escalated": True}
+
+    # Circuit breaker aberto → fast-fail sem gastar quota nem tempo.
+    if _breaker_is_open():
+        log.warning("Circuit breaker aberto — fast-fail sem chamar o Gemini")
+        return {
+            "diagnosis":            "LLM indisponível (quota Gemini esgotada) — circuit breaker aberto.",
+            "escalated":            True,
+            "escalation_reason":    "Circuit breaker de quota aberto",
+            "resolved":             False,
+            "open_postmortem":      False,
+            "notification_message": (
+                f"🔴 *[ESCALADO — LLM INDISPONÍVEL]*\n"
+                f"Quota do Gemini esgotada (circuit breaker aberto).\n"
+                f"Incidente em `{payload.get('host')}`: {payload.get('problem')}\n"
+                f"Ação necessária: investigação manual."
+            ),
+            "duration_s": 0.0,
+        }
 
     start = time.time()
     try:
@@ -672,6 +744,9 @@ def run_agent(payload: dict) -> dict:
             match = re.search(r'\{[\s\S]+\}', raw)
             result = json.loads(match.group()) if match else {"raw": raw, "escalated": True}
 
+        # Chegou aqui = Gemini respondeu sem erro de quota → fecha o breaker.
+        _breaker_record_success()
+
     except TimeoutError as e:
         log.warning(f"Deadline excedido: {e}")
         result = {
@@ -691,6 +766,8 @@ def run_agent(payload: dict) -> dict:
 
     except Exception as e:
         log.error(f"Erro no agente: {e}")
+        if _is_quota_error(e):
+            _breaker_record_failure()
         result = {
             "diagnosis":            f"Erro na execução do agente: {e}",
             "escalated":            True,
