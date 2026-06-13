@@ -43,7 +43,7 @@ import re
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -178,6 +178,8 @@ SSH_DIAGNOSE_COMMANDS = {
     "top -bn1 | head -25",
     "ps aux --sort=-%cpu | head -20",
     "ps aux --sort=-%mem | head -20",
+    "ps -eo pid,user,%mem,%cpu,comm --sort=-%mem | head -30",
+    "ps -eo pid,user,%mem,%cpu,args --sort=-%mem | head -20",
     "uptime",
     # Memória / disco / rede
     "free -h",
@@ -197,6 +199,12 @@ SSH_DIAGNOSE_COMMANDS = {
     "sudo tail -n 50 /var/log/zabbix/zabbix_agentd.log",
     # Kernel / hardware
     "dmesg | tail -30",
+    # Proxmox VE — journald é o único backend de log (sem syslog)
+    "journalctl -u pvestatd --since '30 min ago' --no-pager -n 100",
+    "journalctl -u pvestatd --since '1 hour ago' --no-pager -n 100",
+    "journalctl -u pvedaemon --since '30 min ago' --no-pager -n 100",
+    "journalctl -u pve-cluster --since '30 min ago' --no-pager -n 100",
+    "sudo tail -n 100 /var/log/pve-firewall.log",
 }
 
 # Hosts onde ssh_execute pode atuar — espelha o inventário do AGENT.md §7 / docs/hosts.md.
@@ -681,6 +689,59 @@ def _detect_incident_pattern(payload: dict) -> str:
             "INSTRUÇÃO: NÃO consulte items ou histórico do host afetado (agente down = sem dados).\n"
             "Fluxo obrigatório: host_get (obter IP) → ssh_execute restart zabbix-agent2 → problem_active_get (confirmar resolução)."
         )
+
+    # Proxmox VE — hipervisor não tem serviço reiniciável, mas SSH diagnose é obrigatório
+    if any(kw in text for kw in ("proxmox", "node [pve]", "node pve", "[pve/", "qemu/")):
+        return (
+            "\n⚠️  PADRÃO DETECTADO: Alerta Proxmox VE (hipervisor).\n"
+            "DIAGNÓSTICO OBRIGATÓRIO — execute nesta EXATA ordem antes de escalar:\n"
+            "  1. host_get → confirmar IP do host proxmox (192.168.10.254).\n"
+            "  2. item_history_summary_get com hostids=[hostid] e search={'key_': 'mem'} → tendência de memória do nó.\n"
+            "  3. ssh_diagnose host_ip='192.168.10.254' com comandos:\n"
+            "     ['free -h', 'ps aux --sort=-%mem | head -20',\n"
+            "      'journalctl -u pvestatd --since \\'30 min ago\\' --no-pager -n 100',\n"
+            "      'journalctl -u pvedaemon --since \\'30 min ago\\' --no-pager -n 100']\n"
+            "  4. RACIOCÍNIO CROSS-HOST OBRIGATÓRIO: O Proxmox é um hipervisor — se o nó está com memória\n"
+            "     alta, a causa está nas VMs que ele hospeda, NÃO no próprio Proxmox.\n"
+            "     - Analise a saída do pvestatd e do ps para identificar qual VM (qemu/ID) está consumindo mais.\n"
+            "     - O inventário de VMs e seus IPs: docker=192.168.10.112, ansible=192.168.10.104,\n"
+            "       mcp-server=192.168.10.210, zabbix-server=192.168.10.202, zabbix-front=192.168.10.203,\n"
+            "       zabbix-proxy=192.168.10.204.\n"
+            "     - Se a VM identificada estiver no inventário acima, execute ssh_diagnose NESSA VM:\n"
+            "       ['free -h',\n"
+            "        'ps -eo pid,user,%mem,%cpu,comm --sort=-%mem | head -30',\n"
+            "        'ps -eo pid,user,%mem,%cpu,args --sort=-%mem | head -20',\n"
+            "        'journalctl -p err --since \\'30 min ago\\' --no-pager -n 50']\n"
+            "     - ANÁLISE OBRIGATÓRIA da saída do ps — para cada processo com %MEM > 1.0:\n"
+            "       * Liste: nome do processo/aplicação, PID, %MEM, %CPU\n"
+            "       * Agrupe processos do mesmo serviço (ex: múltiplos PIDs do vscode-server → soma total)\n"
+            "       * Identifique processos com consumo anômalo para o tipo de host\n"
+            "       * Calcule o top-3 consumidores com percentual individual e somado\n"
+            "     - Inclua no diagnosis uma lista no formato:\n"
+            "       '1. vscode-server: X% RAM (3 processos) | 2. containerd: Y% | 3. node: Z%'\n"
+            "     - Se a VM identificada NÃO tiver alerta próprio no Zabbix mas estiver consumindo memória\n"
+            "       excessiva, isso é uma anomalia — registre como evidência e escale com essa correlação.\n"
+            "  5. SÓ ENTÃO escale — com diagnosis preenchido E suggested_steps com ≥3 passos concretos.\n"
+            "PROIBIDO: escalar sem ter investigado a VM causadora do alto consumo no hipervisor."
+        )
+
+    # Alta utilização de recurso genérico (CPU, memória, disco)
+    if any(kw in text for kw in (
+        "high memory", "high cpu", "high load", "disk space",
+        "over 9", "over 8", "utilization", "uso alto", "alta utilização",
+        "load average", "cpu usage", "memory usage", "disk usage",
+    )):
+        return (
+            "\n⚠️  PADRÃO DETECTADO: Alta utilização de recurso.\n"
+            "DIAGNÓSTICO OBRIGATÓRIO antes de escalar:\n"
+            "  1. item_history_summary_get → tendência do recurso afetado nas últimas horas.\n"
+            "  2. loki_query_range → correlacionar com logs de erro no mesmo período.\n"
+            "  3. Se Loki retornar vazio: ssh_diagnose no host com comandos relevantes\n"
+            "     (free -h / top / ps aux / journalctl) — NÃO pule esta etapa.\n"
+            "  4. Popule suggested_steps com ≥3 passos concretos antes de escalar.\n"
+            "PROIBIDO: escalar com suggested_steps vazio ou com menos de 2 passos."
+        )
+
     return ""
 
 
@@ -699,6 +760,48 @@ Detalhes : {json.dumps(payload.get('extra', {}), ensure_ascii=False, indent=2)}
 {hint}
 Execute o fluxo completo definido no AGENT.md e retorne o JSON de resposta ao final.
 """
+
+# ---------------------------------------------------------------------------
+# Fallback: gera suggested_steps via LLM se o agente escalou sem popul-los
+# ---------------------------------------------------------------------------
+
+def _ensure_suggested_steps(result: dict, payload: dict) -> None:
+    """Safety net: se escalou com suggested_steps vazio, gera passos via LLM."""
+    if not result.get("escalated"):
+        return
+    if len(result.get("suggested_steps") or []) >= 2:
+        return
+
+    log.warning("suggested_steps vazio após escalação — gerando via fallback LLM")
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        prompt = (
+            f"Incidente Zabbix escalado para operador humano:\n"
+            f"Host: {payload.get('host')} ({payload.get('ip', '')})\n"
+            f"Problema: {payload.get('problem')}\n"
+            f"Diagnóstico do agente: {result.get('diagnosis', 'não disponível')}\n"
+            f"Causa raiz identificada: {result.get('root_cause', 'não determinada')}\n\n"
+            f"Gere de 3 a 5 passos concretos de investigação e remediação para o operador SRE.\n"
+            f"Inclua comandos reais quando aplicável.\n"
+            f"Responda SOMENTE com um JSON array de strings. Exemplo:\n"
+            f'["Verificar X com `comando Y`", "Analisar Z via `comando W`", "Se confirmado, executar Q"]'
+        )
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                http_options=types.HttpOptions(timeout=30_000),
+            ),
+        )
+        raw = (resp.text or "").strip()
+        match = re.search(r'\[[\s\S]+?\]', raw)
+        if match:
+            steps = json.loads(match.group())
+            if isinstance(steps, list) and steps:
+                result["suggested_steps"] = steps
+                log.info(f"suggested_steps (fallback): {len(steps)} passos gerados")
+    except Exception as e:
+        log.warning(f"Fallback suggested_steps falhou: {e}")
 
 # ---------------------------------------------------------------------------
 # Motor ReAct — Gemini Flash + MCP Zabbix
@@ -934,6 +1037,9 @@ def run_agent(payload: dict) -> dict:
             match = re.search(r'\{[\s\S]+\}', raw)
             result = json.loads(match.group()) if match else {"raw": raw, "escalated": True}
 
+        # Safety net: garante suggested_steps preenchidos quando escalado
+        _ensure_suggested_steps(result, payload)
+
         # Chegou aqui = Gemini respondeu sem erro de quota → fecha o breaker.
         _breaker_record_success()
 
@@ -1005,7 +1111,7 @@ def notify(message: str) -> None:
 def log_incident(payload: dict, result: dict) -> None:
     INCIDENT_LOG.parent.mkdir(parents=True, exist_ok=True)
     record = {
-        "timestamp":   datetime.utcnow().isoformat(),
+        "timestamp":   datetime.now().astimezone().isoformat(),
         "host":        payload.get("host", "unknown"),
         "problem":     payload.get("problem", "unknown"),
         "severity":    payload.get("severity", "unknown"),

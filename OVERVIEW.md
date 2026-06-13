@@ -1,7 +1,7 @@
 # Visão Geral do Ambiente — HomeLAB Observabilidade
 
 > **Documento:** referência para quem está conhecendo o ambiente pela primeira vez.
-> **Última atualização:** 2026-06-12 — Agente autônomo v2.4.0: cooldown semântico anti-flapping, MCP multi-servidor (Zabbix + K8s + Context7), correlação log × métrica (Loki), migração SDK `google-genai`; monitoramento do Minikube via Zabbix (host group Kubernetes, Action 7, RBAC); runbooks RB-006 e RB-007
+> **Última atualização:** 2026-06-12 — Agente autônomo v2.6.0: Proxmox VE integrado ao inventário SSH (192.168.10.254), padrão cross-host (hipervisor → VM causadora → análise por processo top-3), `_ensure_suggested_steps()` fallback, Action 7 expandida para grupo Hypervisors, fix timezone UTC-3; v2.4.0: cooldown semântico anti-flapping, MCP multi-servidor, correlação Loki (RCA)
 > **Responsável:** Robson Santiago | SRE / Engenheiro de Observabilidade
 
 ---
@@ -29,8 +29,9 @@ Além disso, o ambiente conta com um **MCP Server** que expõe os dados do Zabbi
 
 ### Inventário de VMs
 
-| VM | IP | vCPU | RAM | Disco | OS | Função |
+| Host | IP | vCPU | RAM | Disco | OS | Função |
 |---|---|---|---|---|---|---|
+| `proxmox` | 192.168.10.254 | — | — | — | Proxmox VE | Hipervisor — gerencia todas as VMs |
 | `ansible` | 192.168.10.104 | 2 | 6 GB | 32 GB | Fedora 40 | Stack de Observabilidade |
 | `docker` | 192.168.10.112 | 4 | 6 GB | 32 GB | Fedora 40 | Minikube / Kubernetes |
 | `mcp-server` | 192.168.10.210 | 1 | 2 GB | 32 GB | RHEL 9.7 | MCP Server para Zabbix |
@@ -241,19 +242,20 @@ Host de workloads Kubernetes via **Minikube**. Será a **fonte de dados de telem
 
 ---
 
-### 4.5 Agente Autônomo de Incidentes — `zabbix_agent.py` (v2.4.0)
+### 4.5 Agente Autônomo de Incidentes — `zabbix_agent.py` (v2.6.0)
 
 Agente de resposta a incidentes que roda na **workstation** (`192.168.10.108`), fora das VMs do lab. Recebe webhooks do Zabbix, investiga de forma autônoma com LLM + MCP + Loki e age dentro dos guardrails do `AGENT.md`.
 
 | Atributo | Valor |
 |----------|-------|
-| Implementação | `scripts/zabbix_agent.py` (v2.4.0) |
+| Implementação | `scripts/zabbix_agent.py` (v2.6.0) |
 | Modelo | Gemini Flash 2.5 — SDK `google-genai` 2.8.0 |
 | Webhook | `http://192.168.10.108:9001` |
 | MCP Zabbix | `.210:8080` — diagnóstico + acknowledge (12 tools expostas) |
 | MCP Kubernetes | `.210:8081` — investigação de pods read-only (14 tools) |
 | MCP Context7 | `mcp.context7.com` — doc oficial sob demanda (fase 3.6) |
 | Correlação | Loki `.104:3100` — correlação log × métrica para RCA |
+| SSH Inventário | ansible, docker, mcp-server, zabbix-front, zabbix-proxy, **proxmox** (192.168.10.254) |
 | Notificação | Telegram (🟢 🔴 🟡 🔁 RECORRENTE / 🔴 PERSISTENTE) |
 | Configuração | `.env.zabbix-agent` (template: `.env.zabbix-agent.example`) |
 
@@ -263,6 +265,8 @@ Trigger Zabbix → Action → webhook
   → aguarda 60s (descarta se resolver sozinho) → acknowledge
   → [1] Zabbix MCP: host_get, problem_get, history_get
   → [2] K8s MCP: pods_list, events_list, pods_log (se aplicável)
+  → [2b] cross-host: alerta no Proxmox → SSH 192.168.10.254 → identifica VM causadora
+         → SSH na VM → análise por processo (ranking top-3)
   → [3.5] Loki: correlação log × métrica → root_cause + confidence
   → [3.6] Context7: doc oficial (só na trilha de escalação sem causa clara)
   → ação autônoma ou escalação → Telegram
@@ -271,6 +275,13 @@ Trigger Zabbix → Action → webhook
 **Anti-flapping (v2.4.0):** cooldown semântico por `(host, trigger)` — mesmo trigger re-disparado em menos de 2h recebe notificação curta 🔁 RECORRENTE sem re-rodar o LLM. A partir da 3ª ocorrência: 🔴 PERSISTENTE com recomendação de intervenção.
 
 **Resiliência (v2.3.0):** fila limitada + pool de workers, idempotência por `eventid`, deadline por chamada/incidente, circuit breaker de quota (429), scheduler de persistência.
+
+**Novidades v2.6.0:**
+- Proxmox VE (192.168.10.254) adicionado ao inventário SSH (`SSH_ALLOWED_HOSTS`)
+- Padrão cross-host: alerta no hipervisor → SSH Proxmox → identifica VM causadora → SSH na VM → análise por processo com ranking top-3
+- `_ensure_suggested_steps()`: fallback garante `suggested_steps` preenchidos em toda escalação
+- Action 7 no Zabbix expandida para cobrir grupo `Hypervisors` (inclui proxmox)
+- Fix timezone: `datetime.now().astimezone()` — UTC-3 Fortaleza, alinhado com Zabbix
 
 > Predecessor: `docs/archive/agent_orchestrator.py` (v1) — protótipo Claude API + MCP remoto. Aposentado em 2026-06-11 (MCP remoto não alcança IP privado); nunca rodou em produção.
 
@@ -333,13 +344,14 @@ Agente Autônomo (workstation 192.168.10.108:9001)
     │
 Zabbix Action / Media Type (192.168.10.202/203)
     │
-    └──► zabbix_agent.py (v2.4.0)
+    └──► zabbix_agent.py (v2.6.0)
              ├──► Gemini Flash 2.5 (google-genai, function calling manual)
              ├──► Zabbix MCP (192.168.10.210:8080)   — diagnóstico + acknowledge
              ├──► K8s MCP   (192.168.10.210:8081)   — pods/eventos/logs (read-only)
              ├──► Context7 MCP (mcp.context7.com)   — doc oficial (escalação)
              ├──► Loki      (192.168.10.104:3100)   — correlação log × métrica (RCA)
              ├──► SSH svc-zabbix@<host>             — restart zabbix-agent2
+             ├──► SSH proxmox (192.168.10.254)      — cross-host: identifica VM causadora
              └──► Telegram                           — notificação
 
 [Fase 3 — planejado]
@@ -366,9 +378,10 @@ Prometheus ◄── Zabbix Exporter ◄── Zabbix Server
 - **`painel-estudos-sre` no Minikube** ✅ — imagem `v1.2` rodando, port-forward persistente (:8080)
 - **Port-forwards e DNAT persistentes** ✅ — serviços systemd na VM `docker` (2026-05-29)
 - **Kubernetes MCP Server** ✅ — v0.0.62 instalado em `mcp-server:8081` (2026-05-29)
-- **AGENT.md** ✅ — especificação do agente autônomo de SRE; v2.4.0 (2026-06-12)
+- **AGENT.md** ✅ — especificação do agente autônomo de SRE; v2.6.0 (2026-06-12)
 - **agent_orchestrator.py** 📦 — agente v1 aposentado → `docs/archive/` (2026-06-11)
 - **zabbix_agent.py v2.4.0** ✅ — MCP multi-servidor (Zabbix+K8s+Context7), correlação Loki (RCA), cooldown semântico anti-flapping, resiliência com fila+workers+circuit breaker, SDK `google-genai` (2026-06-12)
+- **zabbix_agent.py v2.6.0** ✅ — Proxmox VE integrado ao agente (Action 7 + SSH_ALLOWED_HOSTS + cross-host reasoning): alerta no hipervisor → SSH proxmox → identifica VM causadora → análise top-3 processos; `_ensure_suggested_steps()` fallback; fix timezone UTC-3 (2026-06-12)
 - **Minikube no Zabbix** ✅ — host group `Kubernetes` (id 23), host `Minikube cluster` (id 10690), template "Kubernetes cluster state by HTTP", Action 7 corrigida para cobrir grupo 23 (2026-06-12)
 - **RBAC K8s** ✅ — `ClusterRole zabbix-monitoring` + binding para `monitoring/zabbix-service-account` (`k8s/zabbix-monitoring-rbac.yaml`) — corrige 403 `endpoints is forbidden`
 - **`focustrack` no Minikube** — manifestos K8s + instrumentação OTEL
@@ -402,6 +415,7 @@ Prometheus ◄── Zabbix Exporter ◄── Zabbix Server
 
 **SSH:**
 ```bash
+ssh 192.168.10.254   # proxmox  — hipervisor Proxmox VE
 ssh 192.168.10.104   # ansible  — stack de observabilidade
 ssh 192.168.10.112   # docker   — Minikube
 ssh 192.168.10.210   # mcp-server
@@ -451,4 +465,4 @@ ssh 192.168.10.204   # zabbix-proxy
 - **Configuração como código:** datasources e configurações do Grafana são provisionados via arquivos em `config/grafana/provisioning/`. Dashboards são gerenciados via API (não file provisioning — bug `allowUiUpdates` no Grafana 13). JSONs dos dashboards ficam em `config/grafana/dashboards/` como fonte de verdade; importar com `scripts/import-dashboards.sh` em setup fresh.
 - **Plugin GraphViz:** este lab existe principalmente para testar o plugin `jdbranham-diagram-panel` v1.10.4 no Grafana 13. Resultados documentados em `graphviz_guide.md`.
 - **Troubleshooting:** sete runbooks em `docs/runbooks/` — RB-001 (stack não sobe), RB-002 (container caído), RB-003 (Zabbix Agent indisponível), RB-004 (Kubernetes MCP Server), RB-005 (serviços K8s offline), RB-006 (handoff quando agente escala), RB-007 (RBAC least-privilege em produção). Para incidentes maiores, usar o template de postmortem em `docs/postmortem/postmortem.md`.
-- **Agente autônomo (v2.4.0):** trata automaticamente RB-003 (restart do agente Zabbix via SSH). Também investiga pods K8s (K8s MCP), correlaciona logs (Loki) e consulta documentação oficial (Context7). Flapping de alertas é suprimido pelo cooldown semântico (🔁 RECORRENTE / 🔴 PERSISTENTE). Roda na workstation, não nas VMs.
+- **Agente autônomo (v2.6.0):** trata automaticamente RB-003 (restart do agente Zabbix via SSH). Também investiga pods K8s (K8s MCP), correlaciona logs (Loki), consulta documentação oficial (Context7) e executa análise cross-host via SSH Proxmox (identificar VM causadora de alerta no hipervisor). Flapping de alertas é suprimido pelo cooldown semântico (🔁 RECORRENTE / 🔴 PERSISTENTE). Roda na workstation, não nas VMs.

@@ -11,6 +11,7 @@
 
 | VM            | IP                | Função                                      |
 |---------------|-------------------|---------------------------------------------|
+| proxmox       | 192.168.10.254    | Hypervisor Proxmox VE (hospeda todas as VMs) |
 | ansible       | 192.168.10.104    | Stack de Observabilidade (este projeto)     |
 | docker        | 192.168.10.112    | Minikube / workloads Kubernetes             |
 | mcp-server    | 192.168.10.210    | Zabbix MCP Server (:8080) + K8s MCP Server (:8081) |
@@ -182,7 +183,7 @@ observability/
 
 | Componente | Detalhe |
 |---|---|
-| Versão | v2.4.0 |
+| Versão | v2.6.0 |
 | Modelo | Gemini Flash 2.5 (`google-genai` SDK) |
 | Webhook | `http://192.168.10.108:9001` (porta configurável via `WEBHOOK_PORT`) |
 | MCP Zabbix | `http://192.168.10.210:8080/mcp` — diagnóstico + acknowledge |
@@ -190,9 +191,10 @@ observability/
 | MCP Context7 | `https://mcp.context7.com/mcp` — doc oficial sob demanda (fase 3.6) |
 | Correlação | Loki `http://192.168.10.104:3100` — correlação log × métrica (RCA) |
 | Notificação | Telegram (🟢 RESOLVIDO / 🔴 ESCALADO / 🔁 RECORRENTE / 🔴 PERSISTENTE) |
-| Anti-flapping | Cooldown semântico por `(host, trigger)` — 2h padrão (`INCIDENT_COOLDOWN`) |
+| Anti-flapping | Cooldown semântico por `(host, trigger)` — 2h padrão (`INCIDENT_COOLDOWN`); fallback para `suggested_steps` se RCA inconclusivo |
 | Acknowledge | Após 60s de persistência do incidente |
 | Restart remoto | Via SSH como `svc-zabbix` (NOPASSWD restrito ao allowlist) |
+| Proxmox | Cross-host reasoning: SSH Proxmox → identifica VM → SSH na VM → ranking de processos |
 
 ```bash
 # Dependências

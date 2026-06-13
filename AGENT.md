@@ -1,6 +1,6 @@
 # AGENT.md — Agente Autônomo de Resposta a Incidentes
 
-> **Versão:** 2.4.0  
+> **Versão:** 2.6.0  
 > **Criado em:** 2026-05-29 | **Atualizado em:** 2026-06-12  
 > **Ambiente:** HomeLAB ProxMox — `192.168.10.0/24`  
 > **Implementação:** `scripts/zabbix_agent.py` — Gemini (google-genai) + MCP Zabbix/K8s/Context7 + Loki  
@@ -66,11 +66,38 @@ Ferramenta customizada `ssh_execute` (implementada no agente, não via MCP):
 - `sudo systemctl stop zabbix-agent`
 - `sudo systemctl status zabbix-agent`
 
-**Allowlist de HOST (guardrail em código — `SSH_ALLOWED_HOSTS`):** o `host_ip` proposto pelo LLM é validado antes da execução. Permitidos: `104, 112, 210, 202, 203, 204`. **`zabbix-db` (`192.168.10.201`) e qualquer host fora do inventário são negados em código** — a proibição do §3.3 não depende do prompt.
+**Allowlist de HOST (guardrail em código — `SSH_ALLOWED_HOSTS`):** o `host_ip` proposto pelo LLM é validado antes da execução. Permitidos: `104, 112, 210, 202, 203, 204, 254`. **`zabbix-db` (`192.168.10.201`) e qualquer host fora do inventário são negados em código** — a proibição do §3.3 não depende do prompt.
 
-**Conta de serviço:** `svc-zabbix` — sem senha, autenticação por chave `homelab_ed25519`, sudoers NOPASSWD restrito ao allowlist acima. Criada em: `ansible` (104), `docker` (112), `mcp-server` (210), `zabbix-server` (202), `zabbix-front` (203), `zabbix-proxy` (204).
+**Tabela de inventário SSH / hosts permitidos (`SSH_ALLOWED_HOSTS`):**
+
+| Host | IP | Papel | Nível de acesso | Grupo Zabbix |
+|---|---|---|---|---|
+| `ansible` | `192.168.10.104` | Stack de observabilidade | restart zabbix-agent2, restart containers (OOM), diagnóstico | — |
+| `docker` | `192.168.10.112` | Kubernetes / Minikube | restart zabbix-agent2, delete pods (CrashLoop), diagnóstico | — |
+| `mcp-server` | `192.168.10.210` | MCP servers | restart zabbix-agent2, diagnóstico | — |
+| `zabbix-server` | `192.168.10.202` | Zabbix Server | restart zabbix-agent2, diagnóstico | — |
+| `zabbix-front` | `192.168.10.203` | Zabbix Frontend | restart zabbix-agent2, diagnóstico | — |
+| `zabbix-proxy` | `192.168.10.204` | Zabbix Proxy | restart zabbix-agent2, diagnóstico | — |
+| `proxmox` | `192.168.10.254` | Hypervisor Proxmox VE | diagnóstico (read-only) | grupo 7 |
+
+> **Proxmox — somente diagnóstico:** o agente pode executar comandos de leitura via `ssh_diagnose` no `proxmox` (192.168.10.254), mas **nunca executa ações destrutivas** no hipervisor (nenhum restart, shutdown ou migração de VM de forma autônoma).
+
+**Conta de serviço:** `svc-zabbix` — sem senha, autenticação por chave `homelab_ed25519`, sudoers NOPASSWD restrito ao allowlist acima. Criada em: `ansible` (104), `docker` (112), `mcp-server` (210), `zabbix-server` (202), `zabbix-front` (203), `zabbix-proxy` (204), `proxmox` (254).
 
 **`script_execute` — atuador privilegiado (guardrail em código):** allowlist de `scriptid` via `ZABBIX_ALLOWED_SCRIPT_IDS` (no `.env.zabbix-agent`). **Fail-closed:** com a variável vazia, nenhum script é executável — o agente devolve erro e escala. O LLM propõe o script; o código autoriza.
+
+**`ssh_diagnose` — comandos de leitura Proxmox (v2.6.0):** subconjunto read-only de `SSH_DIAGNOSE_COMMANDS` adicionado para o host `proxmox` (`192.168.10.254`). Comandos disponíveis:
+
+| Comando | Finalidade |
+|---|---|
+| `sudo systemctl status pvestatd` | Status do daemon de estatísticas do Proxmox |
+| `sudo systemctl status pvedaemon` | Status do daemon principal do Proxmox VE |
+| `sudo journalctl -u pve-firewall --since "15 minutes ago" --no-pager` | Logs recentes do firewall Proxmox (equivalente ao `pve-firewall.log`) |
+| `sudo pvesh get /nodes/proxmox/status` | Status do nó Proxmox (CPU, memória, uptime) |
+| `sudo pvesh get /nodes/proxmox/qemu` | Lista de VMs e seus estados |
+| `sudo pvesh get /nodes/proxmox/tasks --limit 10` | Últimas 10 tarefas executadas no nó |
+
+> Estes comandos são **somente leitura** — nenhum altera estado do hipervisor. Usados na fase `[3] DIAGNOSTICAR` quando o alerta originar do host `proxmox` ou quando o padrão de incidente Proxmox for acionado (ver §4.1).
 
 ### 2.3 Loki — `http://192.168.10.104:3100` (correlação log × métrica)
 
@@ -222,6 +249,53 @@ nunca dispara ação. Desabilitado se `CONTEXT7_MCP_URL` estiver vazio (fail-ope
 
 ---
 
+## 4.1 Padrões conhecidos de incidente
+
+### Proxmox VE — alerta no hipervisor (v2.6.0)
+
+Quando o alerta originar do host `proxmox` (`192.168.10.254`) ou de uma trigger relacionada ao hipervisor, aplicar o seguinte fluxo de **cross-host reasoning**:
+
+```
+[A] ALERTA NO HIPERVISOR
+    Trigger Zabbix no host proxmox → confirmar via Zabbix MCP
+
+[B] SSH NO PROXMOX (diagnóstico read-only)
+    ssh_diagnose proxmox → pvesh get /nodes/proxmox/qemu
+    └── Identificar a VM causadora: CPU alta? Memória alta? VM parada?
+
+[C] SSH NA VM AFETADA
+    ssh_diagnose <IP da VM identificada> → top -bn1 / ps aux / free -h
+    └── Ranking top processos por %MEM e %CPU
+    └── Verificar se há OOM (dmesg | grep -i "oom\|killed") — somente leitura
+
+[D] CORRELACIONAR COM LOKI
+    loki_query_range filtrado pelo hostname da VM afetada
+    └── Buscar logs de erro no intervalo do incidente
+
+[E] DECIDIR
+    ├── OOM confirmado + container → restart autônomo (exit code 137)
+    ├── OOM confirmado + processo do SO → escalar (ação no hipervisor = proibida)
+    ├── VM parada → escalar (reiniciar VM = proibido sem aprovação)
+    └── Causa não clara → escalar com timeline cross-host
+```
+
+> **Regra:** o agente **nunca reinicia VMs, migra workloads ou altera configuração** do Proxmox de forma autônoma. O diagnóstico cross-host é **somente leitura** — o valor está em identificar a VM causadora e entregar o ranking de processos ao SRE, não em agir no hipervisor.
+
+### Recurso alto — padrão genérico (CPU / memória / disco)
+
+Quando a trigger indicar recurso alto (CPU > 90%, memória > 85%, disco > 80%) em qualquer host:
+
+```
+[A] Confirmar via Zabbix MCP → history_get do item afetado (últimos 15 min)
+[B] SSH no host → top -bn1 / df -h / free -h (somente leitura)
+[C] Ranking top processos por %MEM ou %CPU
+[D] loki_query_range centrado no instante do pico → buscar erros correlatos
+[E] Se container com OOM confirmado → restart autônomo
+    Caso contrário → escalar com ranking de processos + timeline
+```
+
+---
+
 ## 5. Formato de notificação (Telegram)
 
 > O JSON de resposta do agente carrega `root_cause`, `correlation_evidence` (timeline log × métrica)
@@ -350,6 +424,7 @@ Quando o cooldown expira, a próxima ocorrência é investigada normalmente (cau
 | `zabbix-server` | `192.168.10.202` | Alta | Restart zabbix-agent2 via SSH, coleta de diagnóstico |
 | `zabbix-front` | `192.168.10.203` | Média | Restart zabbix-agent2 via SSH, coleta de diagnóstico |
 | `zabbix-proxy` | `192.168.10.204` | Média | Restart zabbix-agent2 via SSH, coleta de diagnóstico |
+| `proxmox` | `192.168.10.254` | Alta | Diagnóstico read-only (ssh_diagnose), cross-host reasoning — **nenhuma ação destrutiva** |
 
 ---
 
@@ -385,6 +460,7 @@ cp docs/postmortem/postmortem.md \
 
 | Versão | Data | Alteração |
 |---|---|---|
+| 2.6.0 | 2026-06-12 | **Proxmox VE + cross-host reasoning**: `proxmox` (`192.168.10.254`) adicionado ao `SSH_ALLOWED_HOSTS` (grupo 7 — Hypervisors); padrão de incidente Proxmox com investigação obrigatória cross-host (Proxmox SSH → identificar VM → SSH na VM → ranking de processos por %MEM); padrão genérico de recurso alto; `ssh_diagnose` com comandos Proxmox read-only (`pvestatd`, `pvedaemon`, `pve-firewall.log`, `pvesh`); `_ensure_suggested_steps()` fallback — garante `suggested_steps` preenchidos em toda escalação; fix `datetime.utcnow()` → `datetime.now().astimezone()` (UTC-3 Fortaleza); Action 7 no Zabbix expandida para incluir grupo 7 (Hypervisors) |
 | 2.4.0 | 2026-06-12 | **Cooldown semântico anti-flapping** (`_check_semantic_cooldown`, `_update_semantic_seen`, `_notify_recurring`): mesmo trigger re-disparado dentro de `INCIDENT_COOLDOWN` (2h) recebe notificação curta 🔁/🔴 sem re-rodar o LLM. A partir de `RECURRING_ESCALATION_AT` (3) ocorrências: 🔴 [PERSISTENTE] com recomendação de intervenção. Cooldown expira e reinicia ciclo de investigação. | MCP multi-servidor com roteamento `tool→server` e fail-open. **Kubernetes MCP** (`.210:8081`, read-only, 14 tools) plugado — o agente investiga pods (status/eventos/logs). **Context7 MCP** + fase `[3.6] CONSULTAR DOC`: ao escalar sem causa clara, consulta doc oficial e entrega `possible_causes`/`suggested_checks`/`references` (análise-only). Migração para o SDK `google-genai`. Headers de auth por servidor (Zabbix Bearer, Context7 header próprio) |
 | 2.3.0 | 2026-06-11 | Resiliência e concorrência: fila + pool de workers limitado (back-pressure 503), idempotência por `eventid` (DEDUP_TTL=600s), deadline por chamada/incidente (LLM_CALL_TIMEOUT/INCIDENT_DEADLINE), circuit breaker de quota 429 (BREAKER_THRESHOLD/BREAKER_COOLDOWN), scheduler dedicado para a espera de persistência (fora do pool). Tudo stdlib; estado em memória |
 | 2.2.0 | 2026-06-11 | Guardrails de atuador em código (não só prompt): allowlist de HOST no `ssh_execute` (nega `zabbix-db` e hosts fora do inventário), allowlist de `scriptid` no `script_execute` (fail-closed via `ZABBIX_ALLOWED_SCRIPT_IDS`); webhook com `compare_digest` + cap de corpo (256 KB); `process_incident` resiliente (falha sempre vira notificação de escalação) |
