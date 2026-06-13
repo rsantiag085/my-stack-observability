@@ -1,0 +1,85 @@
+# =============================================================================
+# Zabbix — RBAC para monitorar o minikube (opção B)
+# Concede ao ServiceAccount EM USO (monitoring/zabbix-service-account) as
+# permissões de leitura do estado do cluster + acesso ao kube-state-metrics.
+# Corrige o 403 "endpoints is forbidden". Mantém o token já configurado na macro.
+#
+# Aplicar:   kubectl apply -f k8s/zabbix-monitoring-rbac.yaml
+# Conferir:  kubectl auth can-i list endpoints \
+#              --as=system:serviceaccount:monitoring:zabbix-service-account   # -> yes
+# =============================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zabbix-monitoring
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/metrics
+      - nodes/stats
+      - nodes/proxy
+      - services
+      - services/proxy        # proxy para o kube-state-metrics via API
+      - endpoints             # <- o que faltava (causa do 403)
+      - pods
+      - pods/proxy
+      - namespaces
+      - componentstatuses
+      - persistentvolumes
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "daemonsets", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+  - nonResourceURLs:
+      - "/metrics"
+      - "/metrics/cadvisor"
+      - "/livez"
+      - "/readyz"
+      - "/healthz"
+      - "/version"
+      - "/api"
+      - "/api/*"
+      - "/apis"
+      - "/apis/*"
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: zabbix-monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: zabbix-monitoring
+subjects:
+  # SA que JÁ está em uso (token já está na macro {$KUBE.API.TOKEN}).
+  - kind: ServiceAccount
+    name: zabbix-service-account
+    namespace: monitoring
+# -----------------------------------------------------------------------------
+# Alternativa: se preferir um SA dedicado em vez do existente, descomente abaixo,
+# aplique, e troque o token da macro pelo deste SA:
+#   kubectl -n kube-system get secret zabbix-monitoring-token \
+#     -o jsonpath='{.data.token}' | base64 -d
+# ---
+# apiVersion: v1
+# kind: ServiceAccount
+# metadata: { name: zabbix-monitoring, namespace: kube-system }
+# ---
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: zabbix-monitoring-token
+#   namespace: kube-system
+#   annotations: { kubernetes.io/service-account.name: zabbix-monitoring }
+# type: kubernetes.io/service-account-token
+# (e adicione esse SA em subjects acima)
+# =============================================================================

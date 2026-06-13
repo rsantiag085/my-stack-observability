@@ -1,9 +1,9 @@
 # AGENT.md — Agente Autônomo de Resposta a Incidentes
 
-> **Versão:** 2.3.0  
-> **Criado em:** 2026-05-29 | **Atualizado em:** 2026-06-11  
+> **Versão:** 2.4.0  
+> **Criado em:** 2026-05-29 | **Atualizado em:** 2026-06-12  
 > **Ambiente:** HomeLAB ProxMox — `192.168.10.0/24`  
-> **Implementação:** `scripts/zabbix_agent.py` — Gemini Flash 2.5 + MCP Zabbix + Loki  
+> **Implementação:** `scripts/zabbix_agent.py` — Gemini (google-genai) + MCP Zabbix/K8s/Context7 + Loki  
 > **Leitura obrigatória antes de operar:** `CLAUDE.md` · `docs/hosts.md` · `docs/postmortem/postmortem.md`
 
 ---
@@ -85,14 +85,28 @@ Ferramenta customizada `loki_query_range` (implementada no agente via HTTP, não
 
 Endpoint: `GET /loki/api/v1/query_range`. Operação **somente leitura** — nenhum risco de escrita. Retorno é ordenado cronologicamente e truncado para não estourar o contexto do modelo.
 
-### 2.4 Kubernetes MCP — `http://192.168.10.210:8081/mcp`
+### 2.4 Kubernetes MCP — `http://192.168.10.210:8081/mcp` (v2.4.0)
 
-> Nota: integração K8s não implementada no `zabbix_agent.py` (v2.1.0). Prevista para versão futura.
+Plugado como **segundo servidor MCP** do agente (config `K8S_MCP_URL`). Servidor **read-only**
+(toolsets core + config) — expõe 14 tools de leitura para investigar workloads do Minikube:
+`pods_list`, `pods_get`, `pods_log`, `events_list`, `pods_top`, `nodes_log`, `nodes_stats_summary`,
+`namespaces_list`, `configuration_view`, etc.
 
-| Ferramenta | Finalidade | Nível |
-|---|---|---|
-| `pods_delete` | Deletar pod para forçar recriação | ⚠️ Condicional |
-| `resources_scale` | Escalar deployment | 🔴 Requer aprovação |
+Como é read-only, **não expõe** `pods_delete`/`resources_scale` — então o agente **diagnostica**
+o pod (status, eventos, logs) mas **não age** sobre ele; nesse caso escala com a fase 3.6 (doc).
+Ações de escrita (delete de pod sob CrashLoopBackOff etc.) seguem como item futuro, atrás de um
+MCP write-scoped + guardrail, conforme §3.2.
+
+### 2.5 Context7 MCP — `https://mcp.context7.com/mcp` (v2.4.0, fase 3.6)
+
+Plugado como **terceiro servidor MCP** (config `CONTEXT7_MCP_URL` + `CONTEXT7_API_KEY` em header
+próprio). Fonte de **documentação oficial sob demanda** — expõe `resolve-library-id` e `query-docs`.
+Usado na fase `[3.6] CONSULTAR DOC` para enriquecer escalações sem causa clara. **Análise-only:**
+nunca dispara ação. Desabilitado se `CONTEXT7_MCP_URL` estiver vazio (fail-open).
+
+> **Roteamento multi-MCP:** o agente lista as tools de todos os servers ativos no boot do incidente,
+> monta um mapa `tool → servidor` e roteia cada chamada ao dono dela. Server indisponível é
+> ignorado (fail-open) — o agente segue com os demais.
 
 ---
 
@@ -169,6 +183,15 @@ Endpoint: `GET /loki/api/v1/query_range`. Operação **somente leitura** — nen
     c. root_cause = a explicação que liga os dois sinais
        └── Logs não explicam o desvio? → confidence: baixa, escalar com timeline parcial
     d. Classificar a causa raiz: OOM / permissão / config / rede / desconhecida
+
+[3.6] CONSULTAR DOC (Context7 — só na trilha de escalação)
+    Quando for escalar SEM causa clara (confidence baixa, sem runbook, ou host fora do
+    inventário e sem ação possível):
+    a. resolve-library-id com o nome da ferramenta (Proxmox VE, Grafana Loki, Kubernetes...)
+    b. query-docs com a pergunta específica do incidente
+    c. Sintetizar, ancorado na doc: possible_causes + suggested_checks (read-only, p/ o humano)
+       + references → preenche doc_analysis no JSON
+    └── ANÁLISE-ONLY: enriquece a escalação, nunca dispara ação. Hipóteses a verificar.
 
 [4] DECIDIR
     Causa identificada com evidência clara?
@@ -265,16 +288,40 @@ Endpoint: `GET /loki/api/v1/query_range`. Operação **somente leitura** — nen
 *Aguardando:* instrução do SRE
 ```
 
-### Escalações automáticas por limite de resiliência (v2.3.0)
+### Escalações automáticas por limite de resiliência
 
 O agente também escala — sem diagnóstico — quando bate num limite operacional. Cada caso tem
 uma tag própria, e a triagem do humano está no **RB-006**:
 
 ```
-🟡 *[ESCALADO — DEADLINE]*       investigação excedeu INCIDENT_DEADLINE e foi interrompida
-🔴 *[ESCALADO — LLM INDISPONÍVEL]*  circuit breaker aberto (quota Gemini esgotada, 429)
-🔴 *[ESCALADO — FILA CHEIA]*     pool saturado (tempestade de alertas) — incidente não processado
+🟡 *[ESCALADO — DEADLINE]*        investigação excedeu INCIDENT_DEADLINE e foi interrompida
+🔴 *[ESCALADO — LLM INDISPONÍVEL]* circuit breaker aberto (quota Gemini esgotada, 429)
+🔴 *[ESCALADO — FILA CHEIA]*      pool saturado (tempestade de alertas) — incidente não processado
 ```
+
+### Notificações de incidente recorrente (v2.4.0 — anti-flapping)
+
+Quando o mesmo trigger re-dispara dentro de `INCIDENT_COOLDOWN` (padrão: 2h), o agente **não
+re-executa o loop ReAct** — envia apenas uma notificação curta referenciando a investigação anterior:
+
+```
+🔁 *[RECORRENTE]* Mesmo incidente — sem nova investigação
+Host: `<hostname>`
+Problema: <trigger>
+Ocorrências: Nx nos últimos Ymin
+Última análise: há Zmin
+Conclusão anterior: <root_cause da última investigação completa>
+```
+
+A partir de `RECURRING_ESCALATION_AT` ocorrências (padrão: 3), a tag muda e inclui recomendação:
+
+```
+🔴 *[PERSISTENTE]* Mesmo incidente — sem nova investigação
+...
+⚠️ Persiste por N ocorrências — intervenção manual recomendada.
+```
+
+Quando o cooldown expira, a próxima ocorrência é investigada normalmente (causa pode ter mudado).
 
 ---
 
@@ -328,7 +375,7 @@ cp docs/postmortem/postmortem.md \
 
 - **Não é um sistema de monitoramento** — ele reage a alertas, não os cria
 - **Não substitui o SRE** — escala tudo que não tem evidência clara
-- **Não tem memória entre execuções** — cada incidente começa do zero com contexto fresco
+- **Não tem memória persistente** — o cooldown semântico é in-memory; reiniciar o processo reseta os contadores de recorrência. Cada incidente começa com contexto fresco de LLM
 - **Não age em silêncio** — toda ação gera notificação Telegram, sem exceção
 - **Não improvisa** — se não há runbook e a causa não é clara, escala
 
@@ -338,7 +385,8 @@ cp docs/postmortem/postmortem.md \
 
 | Versão | Data | Alteração |
 |---|---|---|
-| 2.3.0 | 2026-06-11 | Resiliência & concorrência: fila + pool de workers limitado (back-pressure 503), idempotência por `eventid`, deadline por chamada/incidente, circuit breaker de quota (429), scheduler dedicado para a espera de persistência (fora do pool). Tudo stdlib; estado em memória (produção exige store externo) |
+| 2.4.0 | 2026-06-12 | **Cooldown semântico anti-flapping** (`_check_semantic_cooldown`, `_update_semantic_seen`, `_notify_recurring`): mesmo trigger re-disparado dentro de `INCIDENT_COOLDOWN` (2h) recebe notificação curta 🔁/🔴 sem re-rodar o LLM. A partir de `RECURRING_ESCALATION_AT` (3) ocorrências: 🔴 [PERSISTENTE] com recomendação de intervenção. Cooldown expira e reinicia ciclo de investigação. | MCP multi-servidor com roteamento `tool→server` e fail-open. **Kubernetes MCP** (`.210:8081`, read-only, 14 tools) plugado — o agente investiga pods (status/eventos/logs). **Context7 MCP** + fase `[3.6] CONSULTAR DOC`: ao escalar sem causa clara, consulta doc oficial e entrega `possible_causes`/`suggested_checks`/`references` (análise-only). Migração para o SDK `google-genai`. Headers de auth por servidor (Zabbix Bearer, Context7 header próprio) |
+| 2.3.0 | 2026-06-11 | Resiliência e concorrência: fila + pool de workers limitado (back-pressure 503), idempotência por `eventid` (DEDUP_TTL=600s), deadline por chamada/incidente (LLM_CALL_TIMEOUT/INCIDENT_DEADLINE), circuit breaker de quota 429 (BREAKER_THRESHOLD/BREAKER_COOLDOWN), scheduler dedicado para a espera de persistência (fora do pool). Tudo stdlib; estado em memória |
 | 2.2.0 | 2026-06-11 | Guardrails de atuador em código (não só prompt): allowlist de HOST no `ssh_execute` (nega `zabbix-db` e hosts fora do inventário), allowlist de `scriptid` no `script_execute` (fail-closed via `ZABBIX_ALLOWED_SCRIPT_IDS`); webhook com `compare_digest` + cap de corpo (256 KB); `process_incident` resiliente (falha sempre vira notificação de escalação) |
 | 2.1.0 | 2026-06-11 | Correlação log × métrica (RCA): ferramenta `loki_query_range` (Loki HTTP), fase `[3.5] CORRELACIONAR` no fluxo, JSON de saída enriquecido (`root_cause`, `correlation_evidence`, `confidence`); postmortem e incident-log passam a registrar causa raiz e timeline |
 | 2.0.0 | 2026-06-10 | Implementação real em `zabbix_agent.py` (Gemini Flash 2.5 + MCP Zabbix); ferramenta `ssh_execute`; conta `svc-zabbix`; acknowledge após 60s; padrões conhecidos de incidente; runbooks carregados integralmente |

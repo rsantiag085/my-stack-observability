@@ -182,26 +182,34 @@ observability/
 
 | Componente | Detalhe |
 |---|---|
-| Modelo | Gemini Flash 2.5 (free tier: 1.500 req/dia) |
-| Webhook | `http://192.168.10.108:9001` (porta configurável) |
-| MCP Zabbix | `http://192.168.10.210:8080/mcp` (12 ferramentas expostas) |
-| Notificação | Telegram |
+| Versão | v2.4.0 |
+| Modelo | Gemini Flash 2.5 (`google-genai` SDK) |
+| Webhook | `http://192.168.10.108:9001` (porta configurável via `WEBHOOK_PORT`) |
+| MCP Zabbix | `http://192.168.10.210:8080/mcp` — diagnóstico + acknowledge |
+| MCP Kubernetes | `http://192.168.10.210:8081/mcp` — investigação de pods (read-only) |
+| MCP Context7 | `https://mcp.context7.com/mcp` — doc oficial sob demanda (fase 3.6) |
+| Correlação | Loki `http://192.168.10.104:3100` — correlação log × métrica (RCA) |
+| Notificação | Telegram (🟢 RESOLVIDO / 🔴 ESCALADO / 🔁 RECORRENTE / 🔴 PERSISTENTE) |
+| Anti-flapping | Cooldown semântico por `(host, trigger)` — 2h padrão (`INCIDENT_COOLDOWN`) |
 | Acknowledge | Após 60s de persistência do incidente |
-| Restart remoto | Via SSH como `svc-zabbix` (NOPASSWD restrito) |
+| Restart remoto | Via SSH como `svc-zabbix` (NOPASSWD restrito ao allowlist) |
 
 ```bash
 # Dependências
-pip install mcp google-generativeai httpx python-dotenv
+pip install mcp google-genai httpx python-dotenv
 
 # Configurar
 cp .env.zabbix-agent.example .env.zabbix-agent
-# editar .env.zabbix-agent
+# editar .env.zabbix-agent com API keys e tokens reais
 
 # Subir em background
 nohup python scripts/zabbix_agent.py --mode server >> logs/zabbix-agent.log 2>&1 &
 
-# Modo teste (simula incidente sem webhook)
+# Modo teste (simula incidente sem webhook real)
 python scripts/zabbix_agent.py --mode test
+
+# Teste de cenário específico (container_down ou oom_correlation)
+python scripts/zabbix_agent.py --mode test --scenario oom_correlation
 ```
 
 > Spec completa, guardrails e inventário de hosts em [`AGENT.md`](AGENT.md).
@@ -219,6 +227,8 @@ python scripts/zabbix_agent.py --mode test
 | RB-003 | `docs/runbooks/RB-003-zabbix-agent-indisponivel.md` | Zabbix Agent indisponível em qualquer host do HomeLAB |
 | RB-004 | `docs/runbooks/RB-004-instalacao-kubernetes-mcp-server.md` | Instalação/reinstalação do Kubernetes MCP Server na VM mcp-server |
 | RB-005 | `docs/runbooks/RB-005-servicos-k8s-docker-vm.md` | Serviços K8s offline na VM docker (painel-estudos-sre, port-forwards, DNAT) |
+| RB-006 | `docs/runbooks/RB-006-handoff-agente-autonomo.md` | Triagem quando o agente escala para humano (ESCALADO / DEADLINE / FILA CHEIA) |
+| RB-007 | `docs/runbooks/RB-007-rbac-least-privilege-producao.md` | RBAC least-privilege do agente em produção (host groups, API roles, MCP ro/rw) |
 
 ---
 

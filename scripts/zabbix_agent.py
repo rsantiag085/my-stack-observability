@@ -2,7 +2,7 @@
 """
 zabbix_agent.py — Agente Autônomo de Incidentes Zabbix
 =======================================================
-Versão   : 2.3.0
+Versão   : 2.5.0
 Criado em: 2026-06-10
 
 Guardrails de atuador em CÓDIGO (não só no prompt):
@@ -23,7 +23,7 @@ O agente conecta ao MCP server em runtime, descobre as ferramentas disponíveis
 automaticamente e as expõe para o Gemini via function calling.
 
 Dependências:
-  pip install mcp google-generativeai httpx python-dotenv
+  pip install mcp google-genai httpx python-dotenv
 
 Uso:
   python zabbix_agent.py --mode server --port 9001
@@ -47,7 +47,8 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import httpx
 from dotenv import load_dotenv
 from mcp import ClientSession
@@ -94,6 +95,17 @@ BREAKER_COOLDOWN   = int(os.getenv("BREAKER_COOLDOWN", "300"))
 ZABBIX_MCP_URL     = os.getenv("ZABBIX_MCP_URL", "http://192.168.10.210:8080/mcp")
 ZABBIX_MCP_TOKEN   = os.getenv("ZABBIX_MCP_TOKEN", "")
 
+# Kubernetes MCP — investigação de pods/workloads (VM mcp-server 192.168.10.210:8081).
+# Vazio = desabilitado (fail-open). Servidor read-only (toolsets core + config).
+K8S_MCP_URL        = os.getenv("K8S_MCP_URL", "")
+K8S_MCP_TOKEN      = os.getenv("K8S_MCP_TOKEN", "")
+
+# Context7 MCP — documentação oficial sob demanda (fase 3.6: enriquecer escalações).
+# Vazio = desabilitado (fail-open): o agente segue sem a fase de doc.
+CONTEXT7_MCP_URL       = os.getenv("CONTEXT7_MCP_URL", "")
+CONTEXT7_API_KEY       = os.getenv("CONTEXT7_API_KEY", "")
+CONTEXT7_ALLOWED_TOOLS = {"resolve-library-id", "query-docs"}
+
 # Loki — fonte de logs para correlação log × métrica (RCA)
 LOKI_URL           = os.getenv("LOKI_URL", "http://192.168.10.104:3100")
 
@@ -109,6 +121,14 @@ AGENT_QUEUE_MAX    = int(os.getenv("AGENT_QUEUE_MAX", "50"))
 
 # Idempotência — janela (s) em que um eventid já processado é ignorado se reentregue
 DEDUP_TTL          = int(os.getenv("DEDUP_TTL", "600"))
+
+# Cooldown semântico — evita re-investigação de flapping (mesmo trigger/host
+# abrindo e fechando ao redor do threshold). Janela (s) após a última investigação
+# em que novas ocorrências do par (host, trigger) recebem só uma notificação curta,
+# sem re-rodar o loop ReAct + LLM. Ao expirar, a próxima ocorrência é investigada
+# normalmente (causa raiz pode ter mudado).
+INCIDENT_COOLDOWN       = int(os.getenv("INCIDENT_COOLDOWN", "7200"))   # 2 horas
+RECURRING_ESCALATION_AT = int(os.getenv("RECURRING_ESCALATION_AT", "3")) # Nª ocorrência → 🔴
 
 # Espera de persistência (s) antes de assumir o incidente — feita FORA do pool
 # de workers, por uma thread scheduler dedicada (não ocupa slot de worker).
@@ -130,7 +150,7 @@ MCP_ALLOWED_TOOLS = {
     "script_get", "script_execute",
 }
 
-# Comandos SSH permitidos — guardrail de segurança
+# Comandos SSH de AÇÃO permitidos — guardrail de segurança
 SSH_ALLOWED_COMMANDS = {
     "sudo systemctl restart zabbix-agent2",
     "sudo systemctl restart zabbix-agent",
@@ -148,6 +168,37 @@ SSH_ALLOWED_COMMANDS = {
     "systemctl status zabbix-agent",
 }
 
+# Comandos SSH de DIAGNÓSTICO read-only — nenhum altera estado.
+# Para journalctl e tail do Zabbix, adicionar ao sudoers do svc-zabbix:
+#   sudo journalctl --no-pager -n 0 -u zabbix-server  → testar acesso
+#   echo 'svc-zabbix ALL=(ALL) NOPASSWD: /usr/bin/journalctl, /usr/bin/tail' \
+#     >> /etc/sudoers.d/svc-zabbix
+SSH_DIAGNOSE_COMMANDS = {
+    # CPU / processos
+    "top -bn1 | head -25",
+    "ps aux --sort=-%cpu | head -20",
+    "ps aux --sort=-%mem | head -20",
+    "uptime",
+    # Memória / disco / rede
+    "free -h",
+    "df -h",
+    "ss -s",
+    # Logs do sistema (journalctl sem sudo — vê apenas logs visíveis ao usuário)
+    "journalctl -p err --since '30 min ago' --no-pager -n 100",
+    "journalctl -p err --since '1 hour ago' --no-pager -n 100",
+    "journalctl --since '30 min ago' --no-pager -n 100",
+    # Zabbix Server service log
+    "journalctl -u zabbix-server --since '30 min ago' --no-pager -n 100",
+    "journalctl -u zabbix-server --since '1 hour ago' --no-pager -n 100",
+    "journalctl -u zabbix-agent2 --since '30 min ago' --no-pager -n 50",
+    # Arquivo de log do Zabbix (pode precisar de sudo no sudoers)
+    "sudo tail -n 100 /var/log/zabbix/zabbix_server.log",
+    "sudo tail -n 200 /var/log/zabbix/zabbix_server.log",
+    "sudo tail -n 50 /var/log/zabbix/zabbix_agentd.log",
+    # Kernel / hardware
+    "dmesg | tail -30",
+}
+
 # Hosts onde ssh_execute pode atuar — espelha o inventário do AGENT.md §7 / docs/hosts.md.
 # Guardrail em CÓDIGO: o LLM propõe o host_ip, mas só estes são autorizados.
 SSH_ALLOWED_HOSTS = {
@@ -157,6 +208,7 @@ SSH_ALLOWED_HOSTS = {
     "192.168.10.202",  # zabbix-server
     "192.168.10.203",  # zabbix-front
     "192.168.10.204",  # zabbix-proxy
+    "192.168.10.254",  # proxmox (hypervisor)
 }
 # zabbix-db é deliberadamente EXCLUÍDO da allowlist — criticidade crítica,
 # nenhuma ação autônoma (AGENT.md §3.3). Listado à parte para mensagem de erro clara.
@@ -182,45 +234,20 @@ POSTMORTEM_TPL     = Path(__file__).parent.parent / "docs" / "postmortem" / "pos
 POSTMORTEM_DIR     = Path(__file__).parent.parent / "docs" / "postmortem"
 
 # ---------------------------------------------------------------------------
-# Conversão de JSON Schema (MCP) → Gemini Schema
+# Conversão de Tool MCP → FunctionDeclaration (Gemini)
 # ---------------------------------------------------------------------------
 
-def _json_schema_to_gemini(schema: dict) -> genai.protos.Schema:
-    """Converte um JSON Schema dict para genai.protos.Schema."""
-    type_map = {
-        "string":  genai.protos.Type.STRING,
-        "integer": genai.protos.Type.INTEGER,
-        "number":  genai.protos.Type.NUMBER,
-        "boolean": genai.protos.Type.BOOLEAN,
-        "object":  genai.protos.Type.OBJECT,
-        "array":   genai.protos.Type.ARRAY,
-    }
-    schema_type = type_map.get(schema.get("type", "string"), genai.protos.Type.STRING)
-    kwargs = {
-        "type":        schema_type,
-        "description": schema.get("description", ""),
-    }
-    if schema_type == genai.protos.Type.OBJECT:
-        props = schema.get("properties", {})
-        if props:
-            kwargs["properties"] = {k: _json_schema_to_gemini(v) for k, v in props.items()}
-        if "required" in schema:
-            kwargs["required"] = schema["required"]
-    elif schema_type == genai.protos.Type.ARRAY:
-        items = schema.get("items", {"type": "string"})
-        kwargs["items"] = _json_schema_to_gemini(items)
-    return genai.protos.Schema(**kwargs)
+def _mcp_tool_to_gemini(tool) -> types.FunctionDeclaration:
+    """Converte um MCP Tool para types.FunctionDeclaration.
 
-
-def _mcp_tool_to_gemini(tool) -> genai.protos.FunctionDeclaration:
-    """Converte um MCP Tool para genai.protos.FunctionDeclaration."""
+    O SDK google-genai aceita JSON Schema diretamente via `parameters_json_schema`,
+    então o inputSchema do MCP (já em JSON Schema) é repassado sem conversão.
+    """
     input_schema = tool.inputSchema or {}
-    params = _json_schema_to_gemini(input_schema) if input_schema.get("properties") else None
-    return genai.protos.FunctionDeclaration(
-        name=tool.name,
-        description=tool.description or "",
-        parameters=params,
-    )
+    kwargs = {"name": tool.name, "description": tool.description or ""}
+    if input_schema.get("properties"):
+        kwargs["parameters_json_schema"] = input_schema
+    return types.FunctionDeclaration(**kwargs)
 
 # ---------------------------------------------------------------------------
 # Execução SSH — para hosts com Zabbix agent indisponível
@@ -228,28 +255,89 @@ def _mcp_tool_to_gemini(tool) -> genai.protos.FunctionDeclaration:
 
 import subprocess as _subprocess
 
-_SSH_TOOL_DECLARATION = genai.protos.FunctionDeclaration(
+_SSH_TOOL_DECLARATION = types.FunctionDeclaration(
     name="ssh_execute",
     description=(
         "Executa um comando via SSH em um host remoto do inventário. "
         "Use quando o Zabbix agent estiver indisponível e for necessário reiniciar o serviço. "
         "Comandos permitidos: sudo systemctl restart/start/stop/status zabbix-agent2 (ou zabbix-agent)."
     ),
-    parameters=genai.protos.Schema(
-        type=genai.protos.Type.OBJECT,
-        properties={
-            "host_ip": genai.protos.Schema(
-                type=genai.protos.Type.STRING,
-                description="IP do host alvo, ex: 192.168.10.210",
-            ),
-            "command": genai.protos.Schema(
-                type=genai.protos.Type.STRING,
-                description="Comando a executar, ex: sudo systemctl restart zabbix-agent2",
-            ),
+    parameters_json_schema={
+        "type": "object",
+        "properties": {
+            "host_ip": {"type": "string", "description": "IP do host alvo, ex: 192.168.10.210"},
+            "command": {"type": "string", "description": "Comando a executar, ex: sudo systemctl restart zabbix-agent2"},
         },
-        required=["host_ip", "command"],
-    ),
+        "required": ["host_ip", "command"],
+    },
 )
+
+
+_SSH_DIAGNOSE_DECLARATION = types.FunctionDeclaration(
+    name="ssh_diagnose",
+    description=(
+        "Coleta diagnóstico read-only via SSH: logs do sistema, processos e uso de recursos. "
+        "Use na fase [3.5b] quando Loki não retornar logs suficientes para determinar a causa raiz.\n"
+        "Comandos disponíveis (passe os relevantes para o problema):\n"
+        "  CPU/procs: 'top -bn1 | head -25'  |  'ps aux --sort=-%cpu | head -20'  |  'uptime'\n"
+        "  Memória: 'free -h'  |  'ps aux --sort=-%mem | head -20'\n"
+        "  Disco/rede: 'df -h'  |  'ss -s'\n"
+        "  Logs sistema: 'journalctl -p err --since \\'30 min ago\\' --no-pager -n 100'\n"
+        "  Zabbix svc: 'journalctl -u zabbix-server --since \\'30 min ago\\' --no-pager -n 100'\n"
+        "  Log arquivo: 'sudo tail -n 100 /var/log/zabbix/zabbix_server.log'\n"
+        "  Kernel: 'dmesg | tail -30'"
+    ),
+    parameters_json_schema={
+        "type": "object",
+        "properties": {
+            "host_ip": {"type": "string", "description": "IP do host alvo, ex: 192.168.10.202"},
+            "commands": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Lista de comandos do allowlist a executar. Escolha os relevantes para o incidente.",
+            },
+        },
+        "required": ["host_ip", "commands"],
+    },
+)
+
+
+def _ssh_diagnose(host_ip: str, commands: list) -> str:
+    """Executa uma lista de comandos read-only via SSH e retorna a saída concatenada."""
+    host_ip = host_ip.strip()
+    if host_ip in SSH_DENIED_HOSTS:
+        return f"ERRO: host {host_ip} é crítico (zabbix-db) — diagnóstico SSH bloqueado."
+    if host_ip not in SSH_ALLOWED_HOSTS:
+        return f"ERRO: host {host_ip} fora do inventário — diagnóstico SSH bloqueado."
+    if not commands:
+        return "ERRO: lista de comandos vazia."
+
+    parts = []
+    for cmd in commands[:6]:   # limite de 6 comandos por chamada
+        cmd = cmd.strip()
+        if cmd not in SSH_DIAGNOSE_COMMANDS:
+            parts.append(f"# {cmd}\nERRO: comando fora do allowlist diagnóstico.")
+            continue
+        ssh_cmd = [
+            "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+            "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+            f"{SSH_USER}@{host_ip}", cmd,
+        ]
+        log.info(f"SSH-diag → {SSH_USER}@{host_ip}: {cmd}")
+        try:
+            r = _subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=20)
+            out = (r.stdout + r.stderr).strip()
+            parts.append(f"# {cmd}\n{out or '(sem saída)'}")
+        except _subprocess.TimeoutExpired:
+            parts.append(f"# {cmd}\nERRO: timeout SSH")
+        except Exception as e:
+            parts.append(f"# {cmd}\nERRO: {e}")
+
+    raw = "\n\n".join(parts)
+    # Trunca para não estourar o contexto do modelo (~6 KB)
+    if len(raw) > 6000:
+        raw = raw[:6000] + "\n... [truncado]"
+    return raw
 
 
 def _ssh_run(host_ip: str, command: str) -> str:
@@ -297,7 +385,7 @@ def _ssh_run(host_ip: str, command: str) -> str:
 # Consulta Loki — correlação log × métrica (RCA)
 # ---------------------------------------------------------------------------
 
-_LOKI_TOOL_DECLARATION = genai.protos.FunctionDeclaration(
+_LOKI_TOOL_DECLARATION = types.FunctionDeclaration(
     name="loki_query_range",
     description=(
         "Consulta logs no Loki (LogQL) numa janela de tempo para correlacionar com a métrica "
@@ -306,28 +394,16 @@ _LOKI_TOOL_DECLARATION = genai.protos.FunctionDeclaration(
         "Exemplos de query: '{container=\"obs-loki\"} |~ \"(?i)error|fatal|panic|oom\"' "
         "ou '{host=\"ansible\"} | logfmt | level=\"error\"'."
     ),
-    parameters=genai.protos.Schema(
-        type=genai.protos.Type.OBJECT,
-        properties={
-            "query": genai.protos.Schema(
-                type=genai.protos.Type.STRING,
-                description='Expressão LogQL. Ex: {container="obs-loki"} |~ "(?i)error|fatal"',
-            ),
-            "minutes": genai.protos.Schema(
-                type=genai.protos.Type.INTEGER,
-                description="Janela de lookback em minutos a partir de end_iso (padrão 15).",
-            ),
-            "end_iso": genai.protos.Schema(
-                type=genai.protos.Type.STRING,
-                description="Fim da janela em ISO8601 (padrão: agora). Use o timestamp do incidente para centrar a janela na anomalia.",
-            ),
-            "limit": genai.protos.Schema(
-                type=genai.protos.Type.INTEGER,
-                description="Máximo de linhas a retornar (padrão 100).",
-            ),
+    parameters_json_schema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": 'Expressão LogQL. Ex: {container="obs-loki"} |~ "(?i)error|fatal"'},
+            "minutes": {"type": "integer", "description": "Janela de lookback em minutos a partir de end_iso (padrão 15)."},
+            "end_iso": {"type": "string", "description": "Fim da janela em ISO8601 (padrão: agora). Use o timestamp do incidente para centrar a janela na anomalia."},
+            "limit": {"type": "integer", "description": "Máximo de linhas a retornar (padrão 100)."},
         },
-        required=["query"],
-    ),
+        "required": ["query"],
+    },
 )
 
 
@@ -429,7 +505,39 @@ def load_context() -> str:
 # Prompts
 # ---------------------------------------------------------------------------
 
+def _doc_phase_block() -> str:
+    """Bloco da fase [3.6] CONSULTAR DOC — incluído só quando o Context7 MCP está ativo."""
+    if not CONTEXT7_MCP_URL:
+        return ""
+    return """
+---
+
+## FASE [3.6] CONSULTAR DOC (Context7) — antes de escalar SEM causa clara
+
+Quando você for ESCALAR sem causa raiz confiável (`confidence: baixa`, sem runbook aplicável,
+ou host fora do inventário e portanto sem ação possível), NÃO entregue só "não sei". Consulte a
+documentação oficial da ferramenta e entregue a escalação MASTIGADA:
+
+1. `resolve-library-id` com o nome da ferramenta do incidente (ex: "Proxmox VE", "Grafana Loki",
+   "Prometheus", "Kubernetes", "Docker") → obtenha o ID da biblioteca.
+2. `query-docs` com esse ID e a pergunta específica do incidente.
+3. Sintetize, ANCORADO nos trechos retornados:
+   - `possible_causes`: causas prováveis, em ordem de probabilidade.
+   - `suggested_checks`: comandos/verificações READ-ONLY para o HUMANO rodar (você NUNCA os executa).
+   - `references`: seções/URLs da doc citadas.
+4. Marque tudo como HIPÓTESE a verificar — não é causa confirmada; a `confidence` segue refletindo sua certeza real.
+
+Mapa incidente → biblioteca: pve/Proxmox → "Proxmox VE"; obs-loki → "Grafana Loki";
+obs-prometheus → "Prometheus"; obs-tempo → "Grafana Tempo"; grafana → "Grafana";
+pod/minikube/k8s → "Kubernetes"; container/docker → "Docker". Se não souber, deixe o
+resolve-library-id deduzir pelo texto do incidente.
+
+A fase [3.6] é ANÁLISE-ONLY: enriquece a escalação, nunca dispara ação.
+"""
+
+
 def build_system_prompt(context: str) -> str:
+    doc_phase = _doc_phase_block()
     return f"""Você é um agente autônomo de SRE especializado em resposta a incidentes Zabbix.
 Seu comportamento é definido pelo AGENT.md abaixo. Leia-o integralmente antes de agir.
 
@@ -462,6 +570,14 @@ Quando o problema indicar alta utilização de recurso:
 - Correlacione com outros itens do mesmo host.
 - NÃO reinicie serviços por causa de uso de recurso sem diagnóstico de causa raiz.
 
+### Padrão: pod / Kubernetes (Minikube na VM docker)
+Quando o problema mencionar pod, Kubernetes, Minikube, CrashLoopBackOff, OOMKilled ou ImagePullBackOff:
+- Se houver ferramentas de Kubernetes disponíveis (pods/list, events/list, pods/log e similares),
+  USE-AS para diagnosticar: liste o pod, leia os eventos e os logs antes de concluir.
+- Delete de pod só é permitido conforme AGENT.md (CrashLoopBackOff > 5 min, confirmado nos eventos).
+- Se não houver ferramenta de ação aplicável, escale — e nesse caso use a fase de doc (Context7) para
+  entregar possíveis causas + verificações `kubectl` ao humano.
+
 ---
 
 ## FASE DE CORRELAÇÃO LOG × MÉTRICA (RCA) — obrigatória antes de DECIDIR
@@ -477,13 +593,25 @@ Depois de coletar métricas/eventos no Zabbix, SEMPRE tente correlacionar com os
 3. Monte uma TIMELINE alinhando os sinais no tempo:
    desvio da métrica → linha de log que o explica → disparo da trigger.
 4. A `root_cause` é a explicação que conecta os dois sinais. Se os logs NÃO explicarem o desvio
-   da métrica, não invente causa: reduza a `confidence`, registre a timeline parcial e escale.
+   da métrica, não invente causa: reduza a `confidence`, registre a timeline parcial e...
+
+## FASE [3.5b] DIAGNOSTICAR NO HOST (SSH) — quando Loki não tem logs
+
+Se a fase [3.5] retornar vazio ou logs insuficientes para confirmar a causa raiz, e o host estiver
+no inventário (não é zabbix-db), chame `ssh_diagnose` ANTES de escalar:
+
+- Para incidente de **CPU/load alto**: execute `top -bn1 | head -25`, `ps aux --sort=-%cpu | head -20`, `uptime`
+- Para incidente de **serviço Zabbix**: execute `journalctl -u zabbix-server --since '30 min ago' --no-pager -n 100` e `sudo tail -n 100 /var/log/zabbix/zabbix_server.log`
+- Para qualquer incidente no host: `journalctl -p err --since '30 min ago' --no-pager -n 100`
+- Para memória: `free -h`, `ps aux --sort=-%mem | head -20`
+
+A saída do ssh_diagnose é **evidência concreta** — inclua os processos/logs relevantes na `correlation_evidence` e use-os para determinar a `root_cause`. Só então passe para a fase [3.6] ou escalação.
 
 Mapeamento host → fonte de log (LogQL):
 - container caído no host `ansible` → `{{container="<nome>"}}` (ex: obs-loki, obs-prometheus, obs-grafana, obs-tempo).
 - host sem container conhecido → comece amplo: `{{host="<hostname>"}} |~ "(?i)error|fatal"`.
 - Se o próprio Loki for o serviço afetado, não dependa só dele — correlacione com a métrica do Zabbix.
-
+{doc_phase}
 ---
 
 REGRAS ABSOLUTAS:
@@ -503,19 +631,32 @@ REGRAS ABSOLUTAS:
     "HH:MM:SS — disparo da trigger"
   ],
   "confidence": "alta | media | baixa",
+  "doc_analysis": {{
+    "consulted": true/false,
+    "source": "Context7: <biblioteca> ou null",
+    "possible_causes": ["causa provável 1", "causa provável 2"],
+    "suggested_checks": ["comando read-only para o humano verificar"],
+    "references": ["seção/URL da doc"]
+  }},
   "action_taken": "o que foi executado ou 'nenhuma'",
   "resolved": true/false,
   "escalated": true/false,
   "escalation_reason": "motivo ou null",
-  "notification_message": "mensagem formatada para Telegram (inclua a timeline de correlação)",
+  "suggested_steps": ["passo 1 concreto para o humano tentar", "passo 2", "passo 3"],
+  "notification_message": "mensagem formatada para Telegram (inclua a timeline de correlação e, se houve fase 3.6, as possíveis causas e o que verificar)",
   "open_postmortem": true/false,
   "postmortem_reason": "motivo ou null"
 }}
+
+Regra: `suggested_steps` deve ter de 2 a 5 passos CONCRETOS (com comandos reais) quando `escalated: true`.
+Se `resolved: true`, pode ser vazio `[]`.
+Estes passos serão usados para gerar um runbook rascunho para o operador.
 
 Regras do JSON:
 - `correlation_evidence` deve ser uma lista de eventos em ordem cronológica. Se não houver logs
   correlacionáveis, inclua só os sinais de métrica e deixe `confidence` em "baixa".
 - `root_cause` só pode ter `confidence: alta` se houver evidência de log E de métrica apontando para a mesma causa.
+- `doc_analysis.consulted` = true só se você chamou o Context7 na fase 3.6; senão, `consulted: false` e os demais campos vazios/null.
 """
 
 
@@ -563,38 +704,79 @@ Execute o fluxo completo definido no AGENT.md e retorne o JSON de resposta ao fi
 # Motor ReAct — Gemini Flash + MCP Zabbix
 # ---------------------------------------------------------------------------
 
-async def _mcp_list_tools() -> list[genai.protos.FunctionDeclaration]:
-    """Abre conexão MCP, busca ferramentas e fecha. Operação rápida e isolada."""
-    headers = {"Authorization": f"Bearer {ZABBIX_MCP_TOKEN}"} if ZABBIX_MCP_TOKEN else {}
-    async with streamablehttp_client(ZABBIX_MCP_URL, headers=headers) as (read, write, _):
+def _zabbix_headers() -> dict:
+    return {"Authorization": f"Bearer {ZABBIX_MCP_TOKEN}"} if ZABBIX_MCP_TOKEN else {}
+
+
+def _mcp_servers() -> list[dict]:
+    """Servidores MCP ativos. K8s e Context7 entram só se suas URLs estiverem definidas.
+    Cada server traz seus próprios headers de auth (cada serviço usa um esquema)."""
+    servers = [{
+        "name": "zabbix", "url": ZABBIX_MCP_URL,
+        "headers": _zabbix_headers(), "allowed": MCP_ALLOWED_TOOLS,
+    }]
+    if K8S_MCP_URL:
+        servers.append({
+            "name": "kubernetes", "url": K8S_MCP_URL,
+            "headers": {"Authorization": f"Bearer {K8S_MCP_TOKEN}"} if K8S_MCP_TOKEN else {},
+            "allowed": None,  # servidor read-only: todas as tools são de leitura
+        })
+    if CONTEXT7_MCP_URL:
+        servers.append({
+            "name": "context7", "url": CONTEXT7_MCP_URL,
+            # Context7 autentica pela header própria, não por Authorization Bearer.
+            "headers": {"CONTEXT7_API_KEY": CONTEXT7_API_KEY} if CONTEXT7_API_KEY else {},
+            "allowed": CONTEXT7_ALLOWED_TOOLS,
+        })
+    return servers
+
+
+async def _mcp_list_one(url: str, headers: dict, allowed: set | None) -> list:
+    """Lista as tools de UM servidor MCP (filtradas por `allowed`, ou todas se None)."""
+    async with streamablehttp_client(url, headers=headers) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            tools_response = await session.list_tools()
-            filtered = [t for t in tools_response.tools if t.name in MCP_ALLOWED_TOOLS]
-            log.info(f"Ferramentas MCP: {len(tools_response.tools)} disponíveis → {len(filtered)} + ssh_execute + loki_query_range expostas ao Gemini")
-            return (
-                [_mcp_tool_to_gemini(t) for t in filtered]
-                + [_SSH_TOOL_DECLARATION, _LOKI_TOOL_DECLARATION]
-            )
+            resp = await session.list_tools()
+            return [t for t in resp.tools if allowed is None or t.name in allowed]
 
 
-async def _mcp_call_tool(name: str, args: dict) -> str:
-    """Abre conexão MCP, chama a ferramenta e fecha. Operação rápida e isolada."""
-    headers = {"Authorization": f"Bearer {ZABBIX_MCP_TOKEN}"} if ZABBIX_MCP_TOKEN else {}
-    async with streamablehttp_client(ZABBIX_MCP_URL, headers=headers) as (read, write, _):
+def _collect_tools() -> tuple[list[types.FunctionDeclaration], dict]:
+    """
+    Lista as tools de todos os MCP servers ativos (Zabbix + K8s + Context7), monta as
+    FunctionDeclaration e o mapa de roteamento tool→(url, headers).
+    Fail-open: server indisponível é logado e ignorado — o agente segue com os demais.
+    """
+    decls: list[types.FunctionDeclaration] = []
+    route: dict[str, tuple[str, dict]] = {}
+    for srv in _mcp_servers():
+        try:
+            tools = asyncio.run(_mcp_list_one(srv["url"], srv["headers"], srv["allowed"]))
+        except Exception as e:
+            log.warning(f"MCP {srv['name']} indisponível: {e} — seguindo sem ele")
+            continue
+        for t in tools:
+            route[t.name] = (srv["url"], srv["headers"])
+            decls.append(_mcp_tool_to_gemini(t))
+        log.info(f"MCP {srv['name']}: {len(tools)} tools expostas ao Gemini")
+    decls += [_SSH_TOOL_DECLARATION, _SSH_DIAGNOSE_DECLARATION, _LOKI_TOOL_DECLARATION]
+    return decls, route
+
+
+async def _mcp_call(url: str, headers: dict, name: str, args: dict) -> str:
+    """Abre conexão a UM servidor MCP, chama a tool e fecha. Operação rápida e isolada."""
+    async with streamablehttp_client(url, headers=headers) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(name, args)
             return "\n".join(c.text for c in result.content if hasattr(c, "text"))
 
 
-def _proto_args_to_dict(value) -> object:
-    """Converte recursivamente MapComposite/proto args do Gemini para dict puro."""
-    if hasattr(value, "items"):
-        return {k: _proto_args_to_dict(v) for k, v in value.items()}
-    if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
-        return [_proto_args_to_dict(v) for v in value]
-    return value
+def _mcp_call_zabbix(name: str, args: dict) -> str:
+    """Chamada síncrona ao MCP Zabbix — usada pelo scheduler (persistência + ack)."""
+    return asyncio.run(_mcp_call(ZABBIX_MCP_URL, _zabbix_headers(), name, args))
+
+
+# No SDK google-genai, FunctionCall.args já é um dict puro — não precisa de conversão de proto.
 
 # ---------------------------------------------------------------------------
 # Circuit breaker de quota — protege contra rajada de 429 do Gemini
@@ -675,23 +857,23 @@ def run_agent(payload: dict) -> dict:
 
     start = time.time()
     try:
-        # 1. Carregar ferramentas do MCP (conexão rápida e fechada em seguida)
-        declarations = asyncio.run(_mcp_list_tools())
+        # 1. Carregar ferramentas de todos os MCP servers + o mapa de roteamento
+        declarations, route = _collect_tools()
 
-        # 2. Configurar Gemini com as ferramentas descobertas
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL,
-            tools=[genai.protos.Tool(function_declarations=declarations)],
+        # 2. Cliente Gemini com as ferramentas descobertas. O timeout por chamada
+        #    vai no http_options — ATENÇÃO: em MILISSEGUNDOS no google-genai.
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        config = types.GenerateContentConfig(
             system_instruction=build_system_prompt(load_context()),
+            tools=[types.Tool(function_declarations=declarations)],
+            http_options=types.HttpOptions(timeout=LLM_CALL_TIMEOUT * 1000),
+            # Loop ReAct manual: o agente executa as tools, não o SDK.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
-        chat = model.start_chat()
+        chat = client.chats.create(model=GEMINI_MODEL, config=config)
 
         log.info(f"Iniciando ReAct — problema: {payload.get('problem')} | host: {payload.get('host')}")
-        response = chat.send_message(
-            build_incident_prompt(payload),
-            request_options={"timeout": LLM_CALL_TIMEOUT},
-        )
+        response = chat.send_message(build_incident_prompt(payload))
 
         # 3. Loop ReAct: cada tool call abre sua própria conexão MCP
         for turn in range(MAX_TURNS):
@@ -701,20 +883,18 @@ def run_agent(payload: dict) -> dict:
                     f"deadline de incidente ({INCIDENT_DEADLINE}s) excedido no turn {turn + 1}"
                 )
 
-            function_calls = [
-                p for p in response.parts
-                if hasattr(p, "function_call") and p.function_call.name
-            ]
+            function_calls = response.function_calls or []
             if not function_calls:
                 break
 
             tool_results = []
-            for part in function_calls:
-                fc   = part.function_call
-                args = _proto_args_to_dict(fc.args)
+            for fc in function_calls:
+                args = dict(fc.args or {})
                 log.info(f"[TURN {turn + 1}] → {fc.name}({args})")
                 if fc.name == "ssh_execute":
                     result_text = _ssh_run(args.get("host_ip", ""), args.get("command", ""))
+                elif fc.name == "ssh_diagnose":
+                    result_text = _ssh_diagnose(args.get("host_ip", ""), args.get("commands", []))
                 elif fc.name == "loki_query_range":
                     result_text = _loki_query_range(
                         args.get("query", ""),
@@ -725,29 +905,28 @@ def run_agent(payload: dict) -> dict:
                 elif fc.name == "script_execute":
                     # Atuador privilegiado: autorizar em código antes de tocar o MCP.
                     denial = _script_execute_guard(args)
-                    result_text = denial if denial else asyncio.run(_mcp_call_tool(fc.name, args))
+                    if denial:
+                        result_text = denial
+                    else:
+                        url, headers = route.get(fc.name, (ZABBIX_MCP_URL, _zabbix_headers()))
+                        result_text = asyncio.run(_mcp_call(url, headers, fc.name, args))
                 else:
-                    result_text = asyncio.run(_mcp_call_tool(fc.name, args))
+                    # Roteia a tool para o servidor MCP dono dela (Zabbix, K8s ou Context7).
+                    url, headers = route.get(fc.name, (ZABBIX_MCP_URL, _zabbix_headers()))
+                    result_text = asyncio.run(_mcp_call(url, headers, fc.name, args))
                 log.info(f"[TURN {turn + 1}] ← {fc.name} OK")
 
                 tool_results.append(
-                    genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
-                            name=fc.name,
-                            response={"result": result_text},
-                        )
+                    types.Part.from_function_response(
+                        name=fc.name,
+                        response={"result": result_text},
                     )
                 )
 
-            response = chat.send_message(
-                tool_results,
-                request_options={"timeout": LLM_CALL_TIMEOUT},
-            )
+            response = chat.send_message(tool_results)
 
         # 4. Extrair JSON final da resposta
-        raw = "".join(
-            p.text for p in response.parts if hasattr(p, "text") and p.text
-        ).strip()
+        raw = (response.text or "").strip()
 
         try:
             result = json.loads(raw)
@@ -842,14 +1021,174 @@ def log_incident(payload: dict, result: dict) -> None:
     log.info(f"Incidente registrado: {record}")
 
 
-def create_postmortem(payload: dict, diagnosis: str) -> Path | None:
+# ---------------------------------------------------------------------------
+# Runbooks automáticos — auto-aprendizado
+# ---------------------------------------------------------------------------
+
+def _slugify(text: str) -> str:
+    """Converte texto em slug kebab-case para nomes de arquivo."""
+    slug = re.sub(r"[^\w\s-]", "", text.lower())
+    slug = re.sub(r"[\s_]+", "-", slug).strip("-")
+    return slug[:50]
+
+
+def _next_rb_number() -> int:
+    """Retorna o próximo número de runbook disponível em docs/runbooks/."""
+    RUNBOOKS_PATH.mkdir(parents=True, exist_ok=True)
+    existing = [
+        int(m.group(1))
+        for f in RUNBOOKS_PATH.glob("RB-[0-9]*.md")
+        if (m := re.match(r"RB-(\d+)", f.name))
+    ]
+    return (max(existing) + 1) if existing else 1
+
+
+def _create_resolved_runbook(payload: dict, result: dict, incident_id: str) -> Path | None:
+    """Cria runbook completo após resolução autônoma bem-sucedida."""
+    RUNBOOKS_PATH.mkdir(parents=True, exist_ok=True)
+    host    = payload.get("host", "unknown")
+    trigger = payload.get("trigger", payload.get("problem", "incident"))
+    rb_num  = _next_rb_number()
+    slug    = f"{_slugify(host)}-{_slugify(trigger)}"
+    rb_path = RUNBOOKS_PATH / f"RB-{rb_num:03d}-{slug}.md"
+
+    timeline = result.get("correlation_evidence") or []
+    timeline_md = "\n".join(f"- {e}" for e in timeline) if timeline else "- (sem timeline registrada)"
+
+    content = f"""# RB-{rb_num:03d} — {host}: {trigger}
+
+> **Criado em:** {datetime.now().strftime('%Y-%m-%d %H:%M')}
+> **Incidente de origem:** `{incident_id}`
+> **Gerado por:** Agente autônomo v2.5.0 (resolução autônoma)
+> **Status:** ✅ RESOLVIDO AUTONOMAMENTE
+
+---
+
+## Sintomas
+
+- **Trigger:** {trigger}
+- **Host:** {host} ({payload.get('ip', 'IP desconhecido')})
+- **Severidade:** {payload.get('severity', 'desconhecida')}
+- **Problema:** {payload.get('problem', '')}
+
+## Causa Raiz
+
+{result.get('root_cause', 'não determinada')}
+
+**Confiança:** {result.get('confidence', 'desconhecida')}
+
+## Timeline (log × métrica)
+
+{timeline_md}
+
+## Solução Executada pelo Agente
+
+{result.get('action_taken', result.get('action', 'nenhuma ação registrada'))}
+
+## Diagnóstico
+
+{result.get('diagnosis', '')}
+
+## Prevenção
+
+> ⚠️ *Seção a preencher pelo operador após revisão.*
+
+---
+*Runbook gerado automaticamente pelo agente após resolução autônoma em {datetime.now().isoformat()}.*
+*Revisar antes de usar como referência em produção.*
+"""
+    rb_path.write_text(content)
+    log.info(f"Runbook criado (resolução autônoma): {rb_path}")
+    return rb_path
+
+
+def _create_escalation_draft(payload: dict, result: dict, incident_id: str) -> Path | None:
+    """Cria rascunho de runbook para incidente escalado — aguarda resolução humana."""
+    POSTMORTEM_DIR.mkdir(parents=True, exist_ok=True)
+    host    = payload.get("host", "unknown")
+    trigger = payload.get("trigger", payload.get("problem", "incident"))
+    draft_path = POSTMORTEM_DIR / f"RB-DRAFT-{incident_id}.md"
+
+    steps = result.get("suggested_steps") or []
+    steps_md = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps)) if steps else "*(agente não gerou passos sugeridos)*"
+
+    timeline = result.get("correlation_evidence") or []
+    timeline_md = "\n".join(f"- {e}" for e in timeline) if timeline else "- (sem correlação registrada)"
+
+    doc = result.get("doc_analysis") or {}
+    doc_md = ""
+    if doc.get("consulted"):
+        causes = "\n".join(f"- {c}" for c in (doc.get("possible_causes") or []))
+        checks = "\n".join(f"- `{c}`" for c in (doc.get("suggested_checks") or []))
+        doc_md = f"\n### Documentação (Context7 — {doc.get('source', '')})\n\n**Possíveis causas:**\n{causes}\n\n**O que verificar:**\n{checks}\n"
+
+    content = f"""# RB-DRAFT — {incident_id}: {host}: {trigger}
+
+> **Rascunho gerado pelo agente em:** {datetime.now().strftime('%Y-%m-%d %H:%M')}
+> **⚠️ AGUARDANDO RESOLUÇÃO HUMANA**
+>
+> Após resolver o incidente, ensine o agente:
+> ```bash
+> python scripts/zabbix_agent.py --teach {incident_id} "como você resolveu"
+> ```
+
+---
+
+## Incidente
+
+- **Host:** {host} ({payload.get('ip', '')})
+- **Problema:** {payload.get('problem', '')}
+- **Trigger:** {trigger}
+- **Severidade:** {payload.get('severity', '')}
+- **Detectado em:** {payload.get('timestamp', datetime.now().isoformat())}
+- **Motivo da escalação:** {result.get('escalation_reason', 'não especificado')}
+
+## Diagnóstico do Agente
+
+{result.get('diagnosis', 'não registrado')}
+
+**Causa raiz (hipótese):** {result.get('root_cause', 'não determinada')}
+**Confiança:** {result.get('confidence', 'desconhecida')}
+
+## Evidências Coletadas
+
+### Timeline (log × métrica)
+
+{timeline_md}
+{doc_md}
+## Passos Sugeridos pelo Agente
+
+{steps_md}
+
+---
+
+## ✏️ RESOLUÇÃO REAL (preencher após resolver)
+
+**O que foi feito:**
+> *(a preencher)*
+
+**Causa confirmada:**
+> *(a preencher)*
+
+**Tempo de resolução:** *(a preencher)*
+
+---
+*Rascunho gerado pelo agente autônomo v2.5.0 em {datetime.now().isoformat()}.*
+"""
+    draft_path.write_text(content)
+    log.info(f"Rascunho de runbook criado: {draft_path}")
+    return draft_path
+
+
+def create_postmortem(payload: dict, diagnosis: str, incident_id: str = "") -> Path | None:
     if not POSTMORTEM_TPL.exists():
         return None
-    ts  = datetime.now().strftime("%Y-%m-%d-%H%M")
-    dst = POSTMORTEM_DIR / f"INC-{ts}.md"
+    if not incident_id:
+        incident_id = f"INC-{datetime.now().strftime('%Y-%m-%d-%H%M')}"
+    dst = POSTMORTEM_DIR / f"{incident_id}.md"
     filled = (
         POSTMORTEM_TPL.read_text()
-        .replace("INC-YYYY-MM-DD-001", f"INC-{ts}")
+        .replace("INC-YYYY-MM-DD-001", incident_id)
         .replace("YYYY-MM-DD", datetime.now().strftime("%Y-%m-%d"))
         .replace("_Preencher aqui._", f"*Auto-gerado pelo agente.*\n\n{diagnosis}")
     )
@@ -881,10 +1220,39 @@ def process_incident(payload: dict) -> None:
         )
 
 
+def _doc_analysis_block(doc: dict | None) -> str:
+    """Renderiza a análise de documentação (fase 3.6) para o postmortem, se houver."""
+    if not doc or not doc.get("consulted"):
+        return ""
+    causes = doc.get("possible_causes") or []
+    checks = doc.get("suggested_checks") or []
+    refs   = doc.get("references") or []
+    parts = [f"\n\n**Análise de documentação ({doc.get('source', 'Context7')}):**"]
+    if causes:
+        parts.append("\n\n*Possíveis causas:*\n" + "\n".join(f"- {c}" for c in causes))
+    if checks:
+        parts.append("\n\n*O que verificar (read-only):*\n" + "\n".join(f"- `{c}`" for c in checks))
+    if refs:
+        parts.append("\n\n*Referências:*\n" + "\n".join(f"- {r}" for r in refs))
+    return "".join(parts)
+
+
 def _process_incident(payload: dict) -> None:
     # A espera de persistência e o acknowledge já aconteceram no scheduler antes
     # de chegar aqui (ver _on_scheduled_due). O worker só faz a investigação.
+
+    # Cooldown semântico: se (host, trigger) foi investigado recentemente,
+    # envia apenas uma notificação curta em vez de rodar todo o loop ReAct.
+    recurring = _check_semantic_cooldown(payload)
+    if recurring:
+        _notify_recurring(payload, recurring)
+        _update_semantic_seen(payload, recurring.get("last_conclusion", "recorrente"))
+        return
+
     log.info(f"Processando: {payload.get('problem')} | host: {payload.get('host')}")
+
+    # ID único do incidente — compartilhado entre postmortem, runbook e draft.
+    incident_id = f"INC-{datetime.now().strftime('%Y-%m-%d-%H%M')}"
 
     result = run_agent(payload)
 
@@ -902,12 +1270,34 @@ def _process_incident(payload: dict) -> None:
             f"**Diagnóstico:** {result.get('diagnosis', '')}\n\n"
             "**Timeline de correlação (log × métrica):**\n"
             + ("\n".join(f"- {e}" for e in timeline) if timeline else "- (sem correlação registrada)")
+            + _doc_analysis_block(result.get("doc_analysis"))
         )
-        pf = create_postmortem(payload, diag_block)
+        pf = create_postmortem(payload, diag_block, incident_id)
         if pf:
             notify(f"📋 Postmortem criado: `{pf.name}`")
 
+    # Auto-runbook: resolução autônoma → runbook completo; escalação → rascunho para humano.
+    if result.get("resolved"):
+        rb = _create_resolved_runbook(payload, result, incident_id)
+        if rb:
+            notify(f"📚 Runbook criado: `{rb.name}`")
+    elif result.get("escalated"):
+        draft = _create_escalation_draft(payload, result, incident_id)
+        if draft:
+            notify(
+                f"📝 Rascunho de runbook gerado: `{draft.name}`\n"
+                f"Após resolver, ensine o agente:\n"
+                f"`python scripts/zabbix_agent.py --teach {incident_id} \"como você resolveu\"`"
+            )
+
     log_incident(payload, result)
+
+    # Registra conclusão no cooldown semântico para suprimir re-investigação de flapping.
+    conclusion = (
+        f"{result.get('root_cause', result.get('diagnosis', 'não determinada'))} "
+        f"(confidence: {result.get('confidence', 'desconhecida')})"
+    )
+    _update_semantic_seen(payload, conclusion)
 
 # ---------------------------------------------------------------------------
 # Fila de trabalho + pool de workers — limita a concorrência
@@ -925,6 +1315,12 @@ _WORK_Q: "queue.Queue[dict]" = queue.Queue(maxsize=AGENT_QUEUE_MAX)
 _dedup_lock = threading.Lock()
 _inflight: set[str] = set()
 _recent: dict[str, float] = {}
+
+# Cooldown semântico — por (host, trigger), independente do eventid.
+# Detecta flapping: mesmo problema abrindo/fechando ao redor do threshold,
+# onde cada nova abertura tem um eventid diferente e passaria pelo dedup normal.
+_sem_lock = threading.Lock()
+_sem_seen: dict[str, dict] = {}
 
 
 def _is_dedup_candidate(eventid: str) -> bool:
@@ -945,6 +1341,84 @@ def _mark_done(eventid: str) -> None:
     with _dedup_lock:
         _inflight.discard(eventid)
         _recent[eventid] = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Cooldown semântico — anti-flapping por (host, trigger)
+# ---------------------------------------------------------------------------
+
+def _sem_key(payload: dict) -> str | None:
+    """Chave semântica host::trigger. None se o payload estiver incompleto."""
+    host    = str(payload.get("host", "")).strip()
+    trigger = str(payload.get("trigger", "")).strip()
+    return f"{host}::{trigger}" if host and trigger else None
+
+
+def _check_semantic_cooldown(payload: dict) -> dict | None:
+    """
+    Retorna a entry de recorrência se o par (host, trigger) foi investigado
+    dentro de INCIDENT_COOLDOWN segundos. None = deve investigar normalmente.
+    Expira e remove a entry quando o cooldown passar.
+    """
+    key = _sem_key(payload)
+    if not key:
+        return None
+    now = time.time()
+    with _sem_lock:
+        entry = _sem_seen.get(key)
+        if not entry:
+            return None
+        if now - entry["last_seen"] > INCIDENT_COOLDOWN:
+            del _sem_seen[key]
+            return None
+        return dict(entry)   # cópia — libera o lock antes de usar
+
+
+def _update_semantic_seen(payload: dict, conclusion: str) -> None:
+    """Registra ou atualiza o estado semântico após uma investigação concluída."""
+    key = _sem_key(payload)
+    if not key:
+        return
+    now = time.time()
+    with _sem_lock:
+        entry = _sem_seen.get(key)
+        if entry:
+            entry["count"]          += 1
+            entry["last_seen"]       = now
+            entry["last_conclusion"] = conclusion
+            entry["last_eventid"]    = str(payload.get("eventid", ""))
+        else:
+            _sem_seen[key] = {
+                "first_seen":      now,
+                "last_seen":       now,
+                "count":           1,
+                "last_conclusion": conclusion,
+                "last_eventid":    str(payload.get("eventid", "")),
+            }
+
+
+def _notify_recurring(payload: dict, entry: dict) -> None:
+    """Envia notificação curta de incidente recorrente sem re-investigar."""
+    host       = payload.get("host", "?")
+    problem    = payload.get("problem", payload.get("trigger", "?"))
+    count      = entry["count"]
+    last_min   = max(1, int((time.time() - entry["last_seen"]) / 60))
+    first_min  = max(1, int((time.time() - entry["first_seen"]) / 60))
+    conclusion = entry.get("last_conclusion", "N/A")
+
+    tag = "🔴 [PERSISTENTE]" if count >= RECURRING_ESCALATION_AT else "🔁 [RECORRENTE]"
+    msg = (
+        f"{tag} Mesmo incidente — sem nova investigação\n"
+        f"Host: `{host}`\n"
+        f"Problema: {problem}\n"
+        f"Ocorrências: {count}x nos últimos {first_min}min\n"
+        f"Última análise: há {last_min}min\n"
+        f"Conclusão anterior: {conclusion}"
+    )
+    if count >= RECURRING_ESCALATION_AT:
+        msg += f"\n\n⚠️ Persiste por {count} ocorrências — intervenção manual recomendada."
+    notify(msg)
+    log.info(f"[RECORRENTE] {host} | {count}x | cooldown ativo")
 
 
 def _worker_loop(worker_id: int) -> None:
@@ -1003,7 +1477,7 @@ def _on_scheduled_due(payload: dict) -> None:
     eventid = str(payload.get("eventid", "")).strip()
 
     try:
-        check = asyncio.run(_mcp_call_tool("problem_active_get", {"eventids": [eventid]}))
+        check = _mcp_call_zabbix("problem_active_get", {"eventids": [eventid]})
         still_active = eventid in check
     except Exception as e:
         log.warning(f"Verificação de persistência falhou: {e} — prosseguindo")
@@ -1015,14 +1489,14 @@ def _on_scheduled_due(payload: dict) -> None:
         return
 
     try:
-        asyncio.run(_mcp_call_tool("event_acknowledge", {
+        _mcp_call_zabbix("event_acknowledge", {
             "eventids": [eventid],
             "action": 6,
             "message": (
                 f"🤖 *Agente autônomo assumiu* — investigando...\n"
                 f"Host: {payload.get('host')} | Severidade: {payload.get('severity')}"
             ),
-        }))
+        })
         log.info(f"Acknowledge enviado após {PERSISTENCE_WAIT}s — eventid {eventid}")
     except Exception as e:
         log.warning(f"Acknowledge falhou: {e}")
@@ -1217,6 +1691,94 @@ PAYLOADS_TEST = {
 PAYLOAD_TEST = PAYLOADS_TEST["container_down"]
 
 # ---------------------------------------------------------------------------
+# Feedback loop — --teach: humano ensina o agente após resolver incidente escalado
+# ---------------------------------------------------------------------------
+
+def cmd_teach(incident_id: str, resolution: str) -> None:
+    """
+    Lê o rascunho do incidente (RB-DRAFT-{incident_id}.md), usa o LLM para sintetizar
+    um runbook completo com a resolução do operador, salva como RB-NNN oficial e
+    remove o rascunho. Notifica via Telegram.
+    """
+    # Procura o draft (postmortem dir primeiro, depois runbooks)
+    candidates = list(POSTMORTEM_DIR.glob(f"RB-DRAFT-{incident_id}*.md"))
+    if not candidates:
+        candidates = list(RUNBOOKS_PATH.glob(f"RB-DRAFT-{incident_id}*.md"))
+    if not candidates:
+        print(f"❌ Rascunho não encontrado para: {incident_id}")
+        print(f"   Buscado em: {POSTMORTEM_DIR} e {RUNBOOKS_PATH}")
+        print(f"   Rascunhos disponíveis:")
+        for d in sorted(POSTMORTEM_DIR.glob("RB-DRAFT-*.md")):
+            print(f"     {d.name}")
+        sys.exit(1)
+
+    draft_path   = candidates[0]
+    draft_text   = draft_path.read_text()
+
+    # Extrai host e trigger do draft para o slug do runbook
+    host_m    = re.search(r"\*\*Host:\*\*\s*([\w-]+)", draft_text)
+    trigger_m = re.search(r"\*\*Trigger:\*\*\s*(.+)", draft_text)
+    host_slug    = _slugify(host_m.group(1) if host_m else "host")
+    trigger_slug = _slugify((trigger_m.group(1) if trigger_m else "incident")[:50])
+
+    print(f"📖 Rascunho encontrado: {draft_path.name}")
+    print(f"🤖 Sintetizando runbook com o LLM...")
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    prompt = (
+        "Você é um engenheiro SRE sênior. Com base na investigação do agente e na resolução "
+        "informada pelo operador, crie um runbook completo em Markdown.\n\n"
+        f"INVESTIGAÇÃO DO AGENTE:\n{draft_text[:3000]}\n\n"
+        f"RESOLUÇÃO DO OPERADOR:\n{resolution}\n\n"
+        "Crie um runbook com as seções abaixo. Use linguagem técnica, comandos concretos "
+        "e seja objetivo.\n\n"
+        "## Problema\nDescreva os sintomas observáveis e as condições de disparo.\n\n"
+        "## Causa Raiz\nCausa confirmada pelo operador (não hipótese).\n\n"
+        "## Diagnóstico\nPasso a passo para identificar o problema (comandos e checks).\n\n"
+        "## Solução\nPasso a passo exato para resolver. Use comandos concretos.\n\n"
+        "## Prevenção\nO que fazer para evitar recorrência.\n\n"
+        "## Referências\nDocumentos ou links relevantes (se houver)."
+    )
+
+    try:
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                http_options=types.HttpOptions(timeout=LLM_CALL_TIMEOUT * 1000)
+            ),
+        )
+        runbook_body = resp.text or ""
+    except Exception as e:
+        print(f"❌ Erro ao chamar LLM: {e}")
+        sys.exit(1)
+
+    rb_num  = _next_rb_number()
+    rb_name = f"RB-{rb_num:03d}-{host_slug}-{trigger_slug}.md"
+    rb_path = RUNBOOKS_PATH / rb_name
+
+    header = (
+        f"# RB-{rb_num:03d} — {rb_name.replace('.md','').replace(f'RB-{rb_num:03d}-','')}\n\n"
+        f"> **Criado em:** {datetime.now().strftime('%Y-%m-%d')}\n"
+        f"> **Incidente de origem:** `{incident_id}`\n"
+        f"> **Gerado por:** Agente autônomo v2.5.0 + operador\n\n---\n\n"
+    )
+    RUNBOOKS_PATH.mkdir(parents=True, exist_ok=True)
+    rb_path.write_text(header + runbook_body)
+    draft_path.unlink()
+
+    msg = (
+        f"📚 Runbook criado: `{rb_name}`\n"
+        f"Incidente: `{incident_id}`\n"
+        f"_Obrigado por ensinar o agente!_"
+    )
+    notify(msg)
+    print(f"✅ Runbook criado: {rb_path}")
+    print(f"🗑️  Rascunho removido: {draft_path.name}")
+    log.info(f"Runbook ensinado criado: {rb_path} (incidente {incident_id})")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1231,9 +1793,20 @@ if __name__ == "__main__":
         help="Cenário do payload de teste (apenas no modo test). "
              "'oom_correlation' exercita a correlação log × métrica.",
     )
+    parser.add_argument(
+        "--teach",
+        nargs=2,
+        metavar=("INCIDENT_ID", "RESOLUTION"),
+        help=(
+            "Ensina o agente após resolução humana de incidente escalado. "
+            "Ex: --teach INC-2026-06-12-0934 'parei o processo X que estava em loop'"
+        ),
+    )
     args = parser.parse_args()
 
-    if args.mode == "server":
+    if args.teach:
+        cmd_teach(args.teach[0], args.teach[1])
+    elif args.mode == "server":
         start_server(args.port)
     elif args.mode == "test":
         log.info(f"Modo teste — simulando incidente Zabbix (cenário: {args.scenario})")

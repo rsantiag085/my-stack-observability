@@ -1,7 +1,7 @@
 # Visão Geral do Ambiente — HomeLAB Observabilidade
 
 > **Documento:** referência para quem está conhecendo o ambiente pela primeira vez.
-> **Última atualização:** 2026-06-10 — Agente autônomo v2 (`zabbix_agent.py`) implementado: Gemini Flash 2.5 + MCP Zabbix + restart via SSH (conta `svc-zabbix`); webhook na porta 9001; `.env.zabbix-agent.example` adicionado; runbook RB-005
+> **Última atualização:** 2026-06-12 — Agente autônomo v2.4.0: cooldown semântico anti-flapping, MCP multi-servidor (Zabbix + K8s + Context7), correlação log × métrica (Loki), migração SDK `google-genai`; monitoramento do Minikube via Zabbix (host group Kubernetes, Action 7, RBAC); runbooks RB-006 e RB-007
 > **Responsável:** Robson Santiago | SRE / Engenheiro de Observabilidade
 
 ---
@@ -241,24 +241,38 @@ Host de workloads Kubernetes via **Minikube**. Será a **fonte de dados de telem
 
 ---
 
-### 4.5 Agente Autônomo de Incidentes — `zabbix_agent.py` (v2.0.0)
+### 4.5 Agente Autônomo de Incidentes — `zabbix_agent.py` (v2.4.0)
 
-Agente de resposta a incidentes que roda na **workstation** (`192.168.10.108`), fora das VMs do lab. Recebe webhooks do Zabbix, investiga de forma autônoma e age dentro dos guardrails do `AGENT.md`.
+Agente de resposta a incidentes que roda na **workstation** (`192.168.10.108`), fora das VMs do lab. Recebe webhooks do Zabbix, investiga de forma autônoma com LLM + MCP + Loki e age dentro dos guardrails do `AGENT.md`.
 
 | Atributo | Valor |
 |----------|-------|
-| Implementação | `scripts/zabbix_agent.py` (v2.0.0) |
-| Modelo | Gemini Flash 2.5 (free tier: 1.500 req/dia) |
+| Implementação | `scripts/zabbix_agent.py` (v2.4.0) |
+| Modelo | Gemini Flash 2.5 — SDK `google-genai` 2.8.0 |
 | Webhook | `http://192.168.10.108:9001` |
-| Ferramentas | 14 ferramentas do MCP Zabbix + `ssh_execute` (customizada) |
-| Notificação | Telegram |
+| MCP Zabbix | `.210:8080` — diagnóstico + acknowledge (12 tools expostas) |
+| MCP Kubernetes | `.210:8081` — investigação de pods read-only (14 tools) |
+| MCP Context7 | `mcp.context7.com` — doc oficial sob demanda (fase 3.6) |
+| Correlação | Loki `.104:3100` — correlação log × métrica para RCA |
+| Notificação | Telegram (🟢 🔴 🟡 🔁 RECORRENTE / 🔴 PERSISTENTE) |
 | Configuração | `.env.zabbix-agent` (template: `.env.zabbix-agent.example`) |
 
-**Fluxo:** Trigger Zabbix → Action → Media Type → webhook → aguarda 60s (descarta se resolver sozinho) → acknowledge → Gemini investiga (`host_get` → `ssh_execute restart` → `problem_active_get`) → Telegram.
+**Fluxo completo:**
+```
+Trigger Zabbix → Action → webhook
+  → aguarda 60s (descarta se resolver sozinho) → acknowledge
+  → [1] Zabbix MCP: host_get, problem_get, history_get
+  → [2] K8s MCP: pods_list, events_list, pods_log (se aplicável)
+  → [3.5] Loki: correlação log × métrica → root_cause + confidence
+  → [3.6] Context7: doc oficial (só na trilha de escalação sem causa clara)
+  → ação autônoma ou escalação → Telegram
+```
 
-**Ação autônoma principal:** ao detectar `agent is not available`, reinicia o `zabbix-agent2` no host afetado via SSH como a conta de serviço `svc-zabbix` (sudo NOPASSWD restrito a `systemctl {start,stop,restart,status} zabbix-agent2`). A conta existe nas 6 VMs do inventário (104, 112, 210, 202, 203, 204).
+**Anti-flapping (v2.4.0):** cooldown semântico por `(host, trigger)` — mesmo trigger re-disparado em menos de 2h recebe notificação curta 🔁 RECORRENTE sem re-rodar o LLM. A partir da 3ª ocorrência: 🔴 PERSISTENTE com recomendação de intervenção.
 
-> Predecessor: `docs/archive/agent_orchestrator.py` (v1) — webhook → Claude API + MCP **remoto** → Telegram/Google Chat. Protótipo aposentado (MCP remoto não alcança IP privado do HomeLAB); nunca rodou em produção. Arquivado como registro histórico; o `zabbix_agent.py` é a implementação ativa. Setup completo na seção 17 do `docs/setup-guide.md`.
+**Resiliência (v2.3.0):** fila limitada + pool de workers, idempotência por `eventid`, deadline por chamada/incidente, circuit breaker de quota (429), scheduler de persistência.
+
+> Predecessor: `docs/archive/agent_orchestrator.py` (v1) — protótipo Claude API + MCP remoto. Aposentado em 2026-06-11 (MCP remoto não alcança IP privado); nunca rodou em produção.
 
 ---
 
@@ -319,11 +333,14 @@ Agente Autônomo (workstation 192.168.10.108:9001)
     │
 Zabbix Action / Media Type (192.168.10.202/203)
     │
-    └──► zabbix_agent.py
-             ├──► Gemini Flash 2.5 (function calling)
-             ├──► Zabbix MCP Server (192.168.10.210:8080) — diagnóstico + acknowledge
-             ├──► SSH svc-zabbix@<host> — restart zabbix-agent2
-             └──► Telegram — notificação
+    └──► zabbix_agent.py (v2.4.0)
+             ├──► Gemini Flash 2.5 (google-genai, function calling manual)
+             ├──► Zabbix MCP (192.168.10.210:8080)   — diagnóstico + acknowledge
+             ├──► K8s MCP   (192.168.10.210:8081)   — pods/eventos/logs (read-only)
+             ├──► Context7 MCP (mcp.context7.com)   — doc oficial (escalação)
+             ├──► Loki      (192.168.10.104:3100)   — correlação log × métrica (RCA)
+             ├──► SSH svc-zabbix@<host>             — restart zabbix-agent2
+             └──► Telegram                           — notificação
 
 [Fase 3 — planejado]
 Prometheus ◄── Zabbix Exporter ◄── Zabbix Server
@@ -349,10 +366,13 @@ Prometheus ◄── Zabbix Exporter ◄── Zabbix Server
 - **`painel-estudos-sre` no Minikube** ✅ — imagem `v1.2` rodando, port-forward persistente (:8080)
 - **Port-forwards e DNAT persistentes** ✅ — serviços systemd na VM `docker` (2026-05-29)
 - **Kubernetes MCP Server** ✅ — v0.0.62 instalado em `mcp-server:8081` (2026-05-29)
-- **AGENT.md** ✅ — especificação do agente autônomo de SRE (guardrails, fluxo, criticidade por host); atualizado para v2.0.0 (2026-06-10)
-- **agent_orchestrator.py** 📦 — agente v1 (protótipo Claude API + MCP remoto); aposentado e movido para `docs/archive/` em 2026-06-11 (nunca rodou; MCP remoto incompatível com rede privada)
-- **zabbix_agent.py** ✅ — agente v2: webhook → Gemini Flash 2.5 + MCP Zabbix + restart via SSH (`svc-zabbix`) → Telegram; ack após 60s (2026-06-10)
+- **AGENT.md** ✅ — especificação do agente autônomo de SRE; v2.4.0 (2026-06-12)
+- **agent_orchestrator.py** 📦 — agente v1 aposentado → `docs/archive/` (2026-06-11)
+- **zabbix_agent.py v2.4.0** ✅ — MCP multi-servidor (Zabbix+K8s+Context7), correlação Loki (RCA), cooldown semântico anti-flapping, resiliência com fila+workers+circuit breaker, SDK `google-genai` (2026-06-12)
+- **Minikube no Zabbix** ✅ — host group `Kubernetes` (id 23), host `Minikube cluster` (id 10690), template "Kubernetes cluster state by HTTP", Action 7 corrigida para cobrir grupo 23 (2026-06-12)
+- **RBAC K8s** ✅ — `ClusterRole zabbix-monitoring` + binding para `monitoring/zabbix-service-account` (`k8s/zabbix-monitoring-rbac.yaml`) — corrige 403 `endpoints is forbidden`
 - **`focustrack` no Minikube** — manifestos K8s + instrumentação OTEL
+- **Promtail no Minikube** — DaemonSet (`k8s/promtail-daemonset.yaml`) aguardando apply para logs dos pods → Loki
 - Alertmanager (roteamento de alertas)
 - Node Exporter (métricas de host para o Prometheus)
 
@@ -419,6 +439,8 @@ ssh 192.168.10.204   # zabbix-proxy
 | `docs/runbooks/RB-003-zabbix-agent-indisponivel.md` | RB-003: Zabbix Agent indisponível — qualquer host do HomeLAB |
 | `docs/runbooks/RB-004-instalacao-kubernetes-mcp-server.md` | RB-004: Instalação/reinstalação do Kubernetes MCP Server |
 | `docs/runbooks/RB-005-servicos-k8s-docker-vm.md` | RB-005: Serviços K8s offline na VM docker (painel, port-forwards, DNAT) |
+| `docs/runbooks/RB-006-handoff-agente-autonomo.md` | RB-006: Triagem quando o agente escala — ESCALADO, DEADLINE, LLM INDISPONÍVEL, FILA CHEIA |
+| `docs/runbooks/RB-007-rbac-least-privilege-producao.md` | RB-007: RBAC least-privilege do agente em produção (host groups, API roles, MCP ro/rw) |
 
 ---
 
@@ -428,5 +450,5 @@ ssh 192.168.10.204   # zabbix-proxy
 - **Reprodutibilidade:** a stack de observabilidade sobe do zero com `make up` na VM `ansible`.
 - **Configuração como código:** datasources e configurações do Grafana são provisionados via arquivos em `config/grafana/provisioning/`. Dashboards são gerenciados via API (não file provisioning — bug `allowUiUpdates` no Grafana 13). JSONs dos dashboards ficam em `config/grafana/dashboards/` como fonte de verdade; importar com `scripts/import-dashboards.sh` em setup fresh.
 - **Plugin GraphViz:** este lab existe principalmente para testar o plugin `jdbranham-diagram-panel` v1.10.4 no Grafana 13. Resultados documentados em `graphviz_guide.md`.
-- **Troubleshooting:** cinco runbooks disponíveis em `docs/runbooks/` — RB-001 (stack não sobe), RB-002 (container caído), RB-003 (Zabbix Agent indisponível), RB-004 (Kubernetes MCP Server), RB-005 (serviços K8s offline na VM docker). Para incidentes maiores, usar o template de postmortem em `docs/postmortem/postmortem.md`.
-- **Agente autônomo:** o `zabbix_agent.py` trata automaticamente o cenário do RB-003 (Zabbix Agent indisponível) reiniciando o serviço via SSH antes de escalar. Roda na workstation, não nas VMs.
+- **Troubleshooting:** sete runbooks em `docs/runbooks/` — RB-001 (stack não sobe), RB-002 (container caído), RB-003 (Zabbix Agent indisponível), RB-004 (Kubernetes MCP Server), RB-005 (serviços K8s offline), RB-006 (handoff quando agente escala), RB-007 (RBAC least-privilege em produção). Para incidentes maiores, usar o template de postmortem em `docs/postmortem/postmortem.md`.
+- **Agente autônomo (v2.4.0):** trata automaticamente RB-003 (restart do agente Zabbix via SSH). Também investiga pods K8s (K8s MCP), correlaciona logs (Loki) e consulta documentação oficial (Context7). Flapping de alertas é suprimido pelo cooldown semântico (🔁 RECORRENTE / 🔴 PERSISTENTE). Roda na workstation, não nas VMs.
